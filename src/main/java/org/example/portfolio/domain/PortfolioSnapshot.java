@@ -9,7 +9,9 @@ import java.util.TreeMap;
 
 /**
  * Read-only copy of a portfolio's state. This is what the service layer hands to
- * other modules so they can never mutate the aggregate behind its back.
+ * other modules so they can never mutate the aggregate behind its back. The positions are
+ * copied on construction, whoever builds it, so a snapshot stays a faithful record of the
+ * state it was taken from (audit, data integrity); the O(n) copy is the price of that.
  *
  * @param stocks           positions by ticker, sorted
  * @param cash             uninvested cash, e.g. rebalance proceeds that did not buy a whole share

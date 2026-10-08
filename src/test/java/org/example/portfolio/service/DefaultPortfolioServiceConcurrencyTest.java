@@ -3,18 +3,23 @@ package org.example.portfolio.service;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.IntConsumer;
 
 import org.example.portfolio.api.PortfolioService;
@@ -211,6 +216,48 @@ class DefaultPortfolioServiceConcurrencyTest {
                 "rebalancing must neither create nor lose value, whatever the interleaving");
         service.rebalanceAndApply(ACCOUNT);
         assertTrue(service.rebalance(ACCOUNT).isEmpty(), "once quiet, one rebalance is enough");
+    }
+
+    @Test
+    void rebalancesKeepUpWithConstantWritesBehindASlowMarketFeed() throws Exception {
+        // every quote takes 2 ms while another thread commits a purchase every 0.2 ms: a rebalance that
+        // fetched its prices again on every retry would lose the race forever
+        Map<String, AtomicInteger> quotes = new ConcurrentHashMap<>();
+        MarketDataProvider slowFeed = ticker -> {
+            quotes.computeIfAbsent(ticker, t -> new AtomicInteger()).incrementAndGet();
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(2));
+            return marketData.getPrice(ticker);
+        };
+        PortfolioService contended = new DefaultPortfolioService(new InMemoryPortfolioRepository(),
+                new MockAccountRepository(), slowFeed, new ProportionalRebalanceStrategy());
+        contended.createPortfolio(ACCOUNT);
+        contended.addStock(ACCOUNT, "AAPL", 40, BigDecimal.ONE);
+        contended.addStock(ACCOUNT, "META", 10, BigDecimal.ONE);
+        contended.addStock(ACCOUNT, "TSLA", 25, BigDecimal.ONE);
+        contended.setTargetAllocation(ACCOUNT, Map.of("AAPL", bd("30"), "META", bd("30"), "NVDA", bd("20"), "GOOGL", bd("20")));
+        AtomicBoolean stop = new AtomicBoolean();
+        Future<?> writer = pool.submit(() -> {
+            while (!stop.get()) {
+                contended.addStock(ACCOUNT, "MSFT", 1, BigDecimal.TEN);
+                LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(200));
+            }
+            return null;
+        });
+        int rebalances = 20;
+
+        try {
+            assertTimeoutPreemptively(Duration.ofSeconds(10), () -> {
+                for (int i = 0; i < rebalances; i++) {
+                    contended.rebalanceAndApply(ACCOUNT);
+                }
+            });
+        } finally {
+            stop.set(true);
+            writer.get();
+        }
+
+        quotes.forEach((ticker, count) -> assertTrue(count.get() <= rebalances,
+                ticker + " was quoted " + count + " times in " + rebalances + " rebalances"));
     }
 
     @Test

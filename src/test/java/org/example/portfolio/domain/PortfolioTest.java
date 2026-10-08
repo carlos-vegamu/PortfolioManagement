@@ -114,6 +114,14 @@ class PortfolioTest {
     }
 
     @Test
+    void missingPriceIsInvalidInputWhetherOrNotTheTickerIsHeld() {
+        Portfolio holdingMeta = empty.addStock("META", 1, bd("5"));
+
+        assertThrows(IllegalArgumentException.class, () -> empty.addStock("META", 1, null));
+        assertThrows(IllegalArgumentException.class, () -> holdingMeta.addStock("META", 1, null));
+    }
+
+    @Test
     void changesReturnANewPortfolioAndLeaveTheOriginalUntouched() {
         Portfolio bought = empty.addStock("META", 10, bd("500"));
         Portfolio sold = bought.sellStock("META", 4);

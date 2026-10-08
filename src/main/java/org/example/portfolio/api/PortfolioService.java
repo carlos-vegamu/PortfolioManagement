@@ -7,6 +7,7 @@ import org.example.portfolio.domain.AllocationReport;
 import org.example.portfolio.domain.PortfolioSnapshot;
 import org.example.portfolio.domain.RebalancePlan;
 import org.example.portfolio.exception.AccountNotFoundException;
+import org.example.portfolio.exception.ConcurrentUpdateException;
 import org.example.portfolio.exception.InsufficientQuantityException;
 import org.example.portfolio.exception.InvalidAllocationException;
 import org.example.portfolio.exception.PortfolioAlreadyExistsException;
@@ -19,7 +20,8 @@ import org.example.portfolio.exception.PriceUnavailableException;
  *
  * <p>Implementations are safe to call from several threads. Each operation works on one
  * consistent state of the portfolio, and changes are atomic: concurrent changes to the same
- * account never interleave and are never lost.
+ * account never interleave and are never lost. A change that keeps losing to others under
+ * extreme contention fails with {@link ConcurrentUpdateException} and can simply be retried.
  */
 public interface PortfolioService {
 

@@ -202,7 +202,7 @@ classDiagram
 | Rule | Where |
 |------|-------|
 | Ticker is trimmed, upper-cased and matches `[A-Z][A-Z0-9.-]{0,9}` | `Stock.normalizeTicker` |
-| Quantity is a positive whole number; price is positive | `Stock`, `TradeAction`, `MarketPrices` |
+| Quantity is a positive whole number; price is positive (a null trade price is an `IllegalArgumentException` too) | `Stock`, `TradeAction`, `MarketPrices` |
 | At most one position per ticker (re-buying merges, average price is the weighted average) | `Portfolio.addStock` |
 | A position that is fully sold disappears; you cannot sell more than you hold | `Portfolio.sellStock` |
 | Target percentages are in (0, 100], tickers are unique and the sum is **exactly 100**; stored without trailing zeros | `TargetAllocation.of` |
@@ -210,6 +210,18 @@ classDiagram
 | Rebalancing needs a target; `rebalance()` never changes anything; `applyRebalance()` checks the total sold per ticker against the holdings and the buys against cash + proceeds before changing anything, and is all-or-nothing | `Portfolio` |
 | A plan contains only sells in `sells` and only buys in `buys` | `RebalancePlan` |
 | **One portfolio per account** | `PortfolioRepository.saveIfAbsent` (atomic) |
+
+**Design notes**
+
+- `PortfolioSnapshot`, `AllocationReport` and `RebalancePlan` copy their collections on construction, whoever builds
+  them. A returned snapshot or plan is a faithful record of the state it came from (audit, data integrity), which is
+  worth the O(n) copy.
+- `Portfolio` keeps identity equality on purpose: the in-memory compare-and-set compares instances, so an `equals`
+  by account id would make every `replace` succeed and bring lost updates back. A database repository would compare
+  a version instead.
+- `applyRebalance` takes the plan's prices as given. Plans should come from the same portfolio at current prices, as
+  `PortfolioService.rebalanceAndApply` guarantees; a hand-made plan selling at an invented price would credit
+  invented cash.
 
 ---
 
@@ -228,16 +240,17 @@ sequenceDiagram
 
     User->>CLI: rebalance acc1 apply
     CLI->>Svc: rebalanceAndApply("acc1")
-    loop until the commit succeeds
+    Note over Svc: prices = new MarketPrices for this call,<br/>shared by every attempt below
+    loop until the commit succeeds (at most 1,000 attempts)
         Svc->>Repo: findByAccountId("acc1")
         Repo-->>Svc: current Portfolio (or PortfolioNotFoundException)
-        Svc->>PF: rebalance(strategy, new MarketPrices)
+        Svc->>PF: rebalance(strategy, prices)
         alt no target allocation defined
             PF-->>Svc: InvalidAllocationException
         else target defined
             PF->>Strat: plan(stocks, cash, target, prices)
             loop every ticker held or targeted
-                Strat->>Mkt: getPrice(ticker), once per ticker
+                Strat->>Mkt: getPrice(ticker), first time a ticker is needed only
                 Mkt-->>Strat: price (or PriceUnavailableException)
             end
             Strat-->>PF: RebalancePlan (sells + buys)
@@ -247,8 +260,9 @@ sequenceDiagram
         Note over PF: check total sold per ticker and cash,<br/>then build a new Portfolio
         PF-->>Svc: updated Portfolio
         Svc->>Repo: replace(current, updated)
-        Note over Svc,Repo: false if another thread committed first:<br/>re-read and plan again
+        Note over Svc,Repo: false if another thread committed first:<br/>re-read and plan again with the same prices
     end
+    Note over Svc: still losing after 1,000 attempts:<br/>ConcurrentUpdateException
     Svc-->>CLI: RebalancePlan
     CLI-->>User: prints SELL / BUY lines and net cash
 
@@ -262,7 +276,9 @@ returns the plan and commits nothing.
 retried freely because building the new state has no side effects. `replace` is a compare-and-set (in memory, a
 single `ConcurrentHashMap.replace(key, expected, updated)` call), so of two concurrent changes to one account
 exactly one commits and the other is re-run on top of it: nothing is lost, and a plan is always applied to the
-state it was computed from. No lock is held while prices are fetched.
+state it was computed from. No lock is held while prices are fetched, and prices are fetched once per call, not per
+attempt, so a retry is pure computation: a slow market feed cannot make a rebalance lose every race against faster
+writers. An update still losing after 1,000 attempts gives up with `ConcurrentUpdateException`.
 
 ---
 
@@ -283,11 +299,11 @@ flowchart TD
     end
 
     subgraph step2["Step 2 - spend the leftover"]
-        E["underweight tickers, largest gap first:<br/>one more share each while leftover >= price"]
+        E["one more share for the underweight tickers whose gaps<br/>add up to the most the leftover affords<br/>(0/1 knapsack, branch and bound)"]
     end
 
     subgraph step3["Step 3 - don't sell into idle cash"]
-        F["targeted tickers being sold:<br/>keep as many shares as the leftover still covers"]
+        F["targeted tickers being sold:<br/>keep as many shares as the leftover still covers<br/>(drift unchanged, fewer trades)"]
     end
 
     L(["Plan: SELL held - wanted, BUY wanted - held<br/>buys <= cash + proceeds; the rest stays as cash"])
@@ -301,10 +317,19 @@ flowchart TD
     F --> L
 ```
 
+**Drift** is the total distance from the target: |value − target value| summed over every ticker and the cash
+(whose target is zero). One more share of a ticker that is short of its target by `gap` (less than a share) lowers
+the drift by 2 × gap and costs one share price, so step 2 is a 0/1 knapsack: the affordable set of extra shares with
+the largest total gap. Taking the largest gap first is not enough, because one expensive share can block two cheaper
+ones that close more (5 AAPL for META 33 / MSFT 33 / NVDA 34 ends 94.7% NVDA that way, instead of one META plus one
+MSFT). Branch and bound over the tickers, sorted by gap per price, finds the best set exactly; its search is capped
+at 10,000 steps, far beyond any realistic portfolio. Step 3 does not change the drift, since unsold shares and idle
+cash count the same, but saves trades. That is also why a ticker can stay more than one share over its target: when
+no underweight ticker is affordable, selling it would only move money into cash.
+
 All arithmetic is exact (`BigDecimal`), so the value of the holdings plus the cash is the same before and after a
-plan is applied, and planning again at the same prices gives an empty plan. Whole shares leave a small drift
-from the exact target: below one share per ticker, plus a cash remainder no underweight stock can be bought
-with. Cost is O(n log n) for n tickers, with one price lookup per ticker.
+plan is applied, the plan reaches the least drift whole shares allow, and planning again at the same prices gives
+an empty plan. Cost is O(n log n) for n tickers plus the bounded search, with one price lookup per ticker.
 
 ---
 
@@ -323,6 +348,7 @@ classDiagram
     PortfolioException <|-- InsufficientQuantityException
     PortfolioException <|-- InsufficientCashException
     PortfolioException <|-- PriceUnavailableException
+    PortfolioException <|-- ConcurrentUpdateException
 ```
 
 | Exception | Raised by | When |
@@ -334,6 +360,7 @@ classDiagram
 | `InsufficientQuantityException` | `Portfolio` | selling more shares than held, including a plan whose sells of one ticker add up to more than is held |
 | `InsufficientCashException` | `Portfolio` | applying a plan whose buys cost more than the cash plus its sale proceeds |
 | `PriceUnavailableException` | `MarketDataProvider` implementations, `MarketPrices` | no price for a ticker needed for valuation or rebalancing |
+| `ConcurrentUpdateException` | `DefaultPortfolioService` | an update lost the compare-and-set race 1,000 times in a row; safe to retry |
 
 **Propagation:** the domain throws, `DefaultPortfolioService` logs the failure **once** and rethrows, and the caller
 decides what to do: `PortfolioCli` prints `Error: …` without logging again; the main application can handle them

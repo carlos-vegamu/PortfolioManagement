@@ -31,7 +31,7 @@ class StockTest {
     void rejectsNonPositiveQuantityOrPrice() {
         assertThrows(IllegalArgumentException.class, () -> new Stock("META", 0, BigDecimal.ONE));
         assertThrows(IllegalArgumentException.class, () -> new Stock("META", 1, BigDecimal.ZERO));
-        assertThrows(NullPointerException.class, () -> new Stock("META", 1, null));
+        assertThrows(IllegalArgumentException.class, () -> new Stock("META", 1, null));
     }
 
     @Test

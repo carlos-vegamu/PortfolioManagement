@@ -9,7 +9,8 @@ import java.util.TreeMap;
 
 /**
  * How a portfolio's value is distributed right now, next to the distribution it aims for.
- * Both come from the same portfolio state, valued with one set of prices.
+ * Both come from the same portfolio state, valued with one set of prices. Like
+ * {@link PortfolioSnapshot}, it copies its map on construction so it cannot change afterwards.
  *
  * @param current        share of the total value held in each stock, in percent (scale 2), sorted by ticker
  * @param cashPercentage share of the total value held as uninvested cash, in percent (scale 2)

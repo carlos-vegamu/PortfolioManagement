@@ -17,6 +17,7 @@ import org.example.portfolio.domain.RebalanceStrategy;
 import org.example.portfolio.domain.Stock;
 import org.example.portfolio.domain.TargetAllocation;
 import org.example.portfolio.exception.AccountNotFoundException;
+import org.example.portfolio.exception.ConcurrentUpdateException;
 import org.example.portfolio.exception.PortfolioAlreadyExistsException;
 import org.example.portfolio.exception.PortfolioException;
 import org.example.portfolio.exception.PortfolioNotFoundException;
@@ -32,9 +33,15 @@ import org.slf4j.LoggerFactory;
  * <p>Thread-safe without locks. Portfolios are immutable, so a change builds a new portfolio
  * from the stored one and commits it with {@link PortfolioRepository#replace} (compare-and-set);
  * if another thread committed first, the change is re-run on the newer state. Every operation
- * therefore reads, and commits, one consistent state of the account.
+ * therefore reads, and commits, one consistent state of the account. Prices are read once per
+ * operation, before any retry, so a retry is pure computation and never waits on market data;
+ * after {@value #MAX_COMMIT_ATTEMPTS} lost races the operation fails with
+ * {@link ConcurrentUpdateException}.
  */
 public class DefaultPortfolioService implements PortfolioService {
+
+    /** Commits to try before giving up; only reached under pathological contention. */
+    static final int MAX_COMMIT_ATTEMPTS = 1_000;
 
     private static final Logger LOG = LoggerFactory.getLogger(DefaultPortfolioService.class);
 
@@ -125,8 +132,9 @@ public class DefaultPortfolioService implements PortfolioService {
     @Override
     public RebalancePlan rebalanceAndApply(String accountId) {
         return logged(accountId, "rebalance-and-apply", () -> {
+            MarketPrices prices = currentPrices();
             Outcome<RebalancePlan> applied = commit(accountId, current -> {
-                RebalancePlan plan = current.rebalance(rebalanceStrategy, currentPrices());
+                RebalancePlan plan = current.rebalance(rebalanceStrategy, prices);
                 return new Outcome<>(current.applyRebalance(plan), plan);
             });
             RebalancePlan plan = applied.result();
@@ -149,14 +157,19 @@ public class DefaultPortfolioService implements PortfolioService {
     /**
      * Optimistic concurrency: builds the new state from the stored one and commits it only if no
      * other thread committed in between; otherwise re-reads and runs {@code change} again, so
-     * {@code change} must not have side effects.
+     * {@code change} must not have side effects (filling the operation's price cache is fine).
+     *
+     * @throws ConcurrentUpdateException after {@value #MAX_COMMIT_ATTEMPTS} lost races
      */
     private <T> Outcome<T> commit(String accountId, Function<Portfolio, Outcome<T>> change) {
-        while (true) {
+        for (int attempt = 1; ; attempt++) {
             Portfolio current = load(accountId);
             Outcome<T> outcome = change.apply(current);
             if (outcome.portfolio() == current || repository.replace(current, outcome.portfolio())) {
                 return outcome;
+            }
+            if (attempt == MAX_COMMIT_ATTEMPTS) {
+                throw new ConcurrentUpdateException(current.getAccountId(), attempt);
             }
             LOG.debug("Account {}: concurrent update detected, retrying", current.getAccountId());
         }
@@ -167,7 +180,7 @@ public class DefaultPortfolioService implements PortfolioService {
         return repository.findByAccountId(id).orElseThrow(() -> new PortfolioNotFoundException(id));
     }
 
-    /** Prices for one operation: each ticker is fetched from the market data at most once. */
+    /** Prices for one operation, retries included: each ticker is fetched from the market data at most once. */
     private MarketPrices currentPrices() {
         return MarketPrices.from(marketData::getPrice);
     }

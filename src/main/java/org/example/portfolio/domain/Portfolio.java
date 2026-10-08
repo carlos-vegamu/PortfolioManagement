@@ -23,8 +23,9 @@ import org.example.portfolio.exception.InvalidAllocationException;
  * The class only guards its own invariants (one position per ticker, positive quantities,
  * non-negative cash, valid target); prices and the buy/sell policy are passed in by the caller.
  *
- * <p>Equality is identity on purpose: repositories rely on it to detect concurrent updates
- * (see {@code PortfolioRepository#replace}).
+ * <p>Equality is identity on purpose, and must stay so: repositories rely on it to detect
+ * concurrent updates (see {@code PortfolioRepository#replace}). An {@code equals} by account
+ * id would make every compare-and-set succeed and silently bring lost updates back.
  */
 public final class Portfolio {
 
@@ -166,6 +167,10 @@ public final class Portfolio {
      * Executes a plan: sells first, crediting their proceeds to the cash, then buys, paid from
      * the cash. The whole plan is checked before anything changes, so it is applied completely
      * or not at all.
+     *
+     * <p>The plan's prices are taken as given, so only apply plans computed from this portfolio
+     * at current prices, as {@code PortfolioService.rebalanceAndApply} does; a hand-made plan
+     * selling at an invented price would credit invented cash.
      *
      * @return the portfolio after the plan; this same portfolio when the plan is empty
      * @throws InsufficientQuantityException if the plan sells more shares of a ticker, in total, than are held

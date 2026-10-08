@@ -10,12 +10,14 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -142,13 +144,51 @@ class ProportionalRebalanceStrategyTest {
     }
 
     @Test
-    void leftoverCashBuysAnExtraShareOfTheLargestGapFirst() {
+    void leftoverCashBuysTheExtraShareThatClosesTheMostGap() {
         // 1,000 cash, 50/50: AMZN gets 1 share (gap 200), MSFT 1 share (gap 150), 350 left.
-        // That buys a second AMZN (largest gap); the 50 left cannot buy anything else.
+        // It affords one more share of either; AMZN closes more. The 50 left buys nothing else.
         RebalancePlan plan = plan(holdings(), "1000", target("AMZN", "50", "MSFT", "50"));
 
         assertEquals(List.of(buy("AMZN", 2), buy("MSFT", 1)), plan.buys());
         assertEquals(0, bd("-950").compareTo(netCash(plan)));
+    }
+
+    @Test
+    void twoCheaperSharesBeatOneExpensiveShareThatOvershoots() {
+        // 5 AAPL = 950 for META 33 / MSFT 33 / NVDA 34: none affords a whole share at first.
+        // The largest gap (NVDA, 323) would take one 900 share: 94.7% NVDA, drift 1,254.
+        // META + MSFT (gaps 313.5 each, 850 together) leave a drift of 646 instead.
+        RebalancePlan plan = plan(holdings("AAPL", 5), "0", target("META", "33", "MSFT", "33", "NVDA", "34"));
+
+        assertEquals(List.of(sell("AAPL", 5)), plan.sells());
+        assertEquals(List.of(buy("META", 1), buy("MSFT", 1)), plan.buys());
+        assertEquals(0, bd("100").compareTo(netCash(plan)));
+    }
+
+    @Test
+    void spreadsTheLeftoverWhenThatReachesTheTargetMoreClosely() {
+        // 10,000 cash for 44 / 28 / 28 at 1,000 / 500 / 500: 4 + 5 + 5 shares leave 1,000.
+        // A 5th of the first (largest gap, 400) gives 50/25/25; a 6th of each other gives 40/30/30.
+        Map<String, BigDecimal> prices = Map.of("GOOGL", bd("1000"), "AMZN", bd("500"), "MSFT", bd("500"));
+        RebalancePlan plan = strategy.plan(holdings(), bd("10000"),
+                target("GOOGL", "44", "AMZN", "28", "MSFT", "28"), MarketPrices.of(prices));
+
+        assertEquals(List.of(
+                new TradeAction("AMZN", TradeSide.BUY, 6, bd("500")),
+                new TradeAction("GOOGL", TradeSide.BUY, 4, bd("1000")),
+                new TradeAction("MSFT", TradeSide.BUY, 6, bd("500"))), plan.buys());
+    }
+
+    @Test
+    void findsTheBestCombinationEvenWhereTakingTheBestValueSharesFirstFails() {
+        // 10,000 cash for AAA 0.95% @100, BBB 9% @1,000, DDD 90.05% @5,000: 1 DDD leaves 5,000 and
+        // gaps of 95, 900 and 4,005. By gap per price, AAA then BBB would close 995 and block DDD;
+        // a second DDD closes 4,005.
+        Map<String, BigDecimal> prices = Map.of("AAA", bd("100"), "BBB", bd("1000"), "DDD", bd("5000"));
+        RebalancePlan plan = strategy.plan(holdings(), bd("10000"),
+                target("AAA", "0.95", "BBB", "9", "DDD", "90.05"), MarketPrices.of(prices));
+
+        assertEquals(List.of(new TradeAction("DDD", TradeSide.BUY, 2, bd("5000"))), plan.buys());
     }
 
     @Test
@@ -218,6 +258,8 @@ class ProportionalRebalanceStrategyTest {
                 assertEquals(0, valueBefore.compareTo(after.getTotalValue(prices)), "value changed in " + context);
                 assertTrue(after.rebalance(strategy, prices).isEmpty(), "second rebalance not empty in " + context);
                 assertNothingAffordableLeftUndone(after, plan, prices, context);
+                assertEquals(0, leastPossibleDrift(portfolio, prices).compareTo(drift(after, prices)),
+                        "drift is not the least possible in " + context);
                 portfolio = after;
             }
         }
@@ -240,6 +282,56 @@ class ProportionalRebalanceStrategyTest {
                 assertTrue(sell.price().compareTo(after.getCash()) > 0, sell + " only raised idle cash in " + context);
             }
         }
+    }
+
+    /** Distance from the target: |value - target value| summed over every ticker, plus the cash. */
+    private static BigDecimal drift(Portfolio portfolio, MarketPrices prices) {
+        BigDecimal total = portfolio.getTotalValue(prices);
+        TargetAllocation target = portfolio.getTargetAllocation().orElseThrow();
+        Set<String> tickers = new TreeSet<>(target.tickers());
+        tickers.addAll(portfolio.getStocks().keySet());
+        BigDecimal drift = portfolio.getCash();
+        for (String ticker : tickers) {
+            long held = portfolio.findStock(ticker).map(Stock::quantity).orElse(0L);
+            BigDecimal value = prices.priceOf(ticker).multiply(BigDecimal.valueOf(held));
+            BigDecimal targetValue = total.multiply(target.asMap().getOrDefault(ticker, BigDecimal.ZERO)).movePointLeft(2);
+            drift = drift.add(value.subtract(targetValue).abs());
+        }
+        return drift;
+    }
+
+    /**
+     * Brute force over every set of target tickers that could get one share more than fits in
+     * their target value: the least drift any whole-share rebalance of {@code portfolio} can reach.
+     */
+    private static BigDecimal leastPossibleDrift(Portfolio portfolio, MarketPrices prices) {
+        BigDecimal total = portfolio.getTotalValue(prices);
+        List<BigDecimal> shortfalls = new ArrayList<>();
+        List<BigDecimal> sharePrices = new ArrayList<>();
+        BigDecimal leftover = total;
+        for (Map.Entry<String, BigDecimal> entry : portfolio.getTargetAllocation().orElseThrow().asMap().entrySet()) {
+            BigDecimal price = prices.priceOf(entry.getKey());
+            BigDecimal targetValue = total.multiply(entry.getValue()).movePointLeft(2);
+            BigDecimal fitting = price.multiply(targetValue.divide(price, 0, RoundingMode.DOWN));
+            leftover = leftover.subtract(fitting);
+            shortfalls.add(targetValue.subtract(fitting));
+            sharePrices.add(price);
+        }
+        BigDecimal least = null;
+        for (int set = 0; set < 1 << shortfalls.size(); set++) {
+            BigDecimal spent = BigDecimal.ZERO;
+            BigDecimal drift = BigDecimal.ZERO;
+            for (int i = 0; i < shortfalls.size(); i++) {
+                boolean extraShare = (set & 1 << i) != 0;
+                spent = spent.add(extraShare ? sharePrices.get(i) : BigDecimal.ZERO);
+                drift = drift.add(extraShare ? sharePrices.get(i).subtract(shortfalls.get(i)) : shortfalls.get(i));
+            }
+            if (spent.compareTo(leftover) <= 0) {
+                BigDecimal withCash = drift.add(leftover.subtract(spent));
+                least = least == null || withCash.compareTo(least) < 0 ? withCash : least;
+            }
+        }
+        return least;
     }
 
     /** 1 to 4 tickers whose percentages (two decimals) add up to exactly 100. */

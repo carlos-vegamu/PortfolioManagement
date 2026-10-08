@@ -3,7 +3,6 @@ package org.example.portfolio.domain;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.Locale;
-import java.util.Objects;
 import java.util.regex.Pattern;
 
 /**
@@ -20,8 +19,7 @@ public record Stock(String ticker, long quantity, BigDecimal averagePurchasePric
         if (quantity <= 0) {
             throw new IllegalArgumentException("Quantity must be positive: " + quantity);
         }
-        Objects.requireNonNull(averagePurchasePrice, "averagePurchasePrice");
-        if (averagePurchasePrice.signum() <= 0) {
+        if (averagePurchasePrice == null || averagePurchasePrice.signum() <= 0) {
             throw new IllegalArgumentException("Price must be positive: " + averagePurchasePrice);
         }
     }

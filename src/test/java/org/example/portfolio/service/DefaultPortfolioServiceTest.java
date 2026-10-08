@@ -26,12 +26,14 @@ import org.example.portfolio.domain.TargetAllocation;
 import org.example.portfolio.domain.TradeAction;
 import org.example.portfolio.domain.TradeSide;
 import org.example.portfolio.exception.AccountNotFoundException;
+import org.example.portfolio.exception.ConcurrentUpdateException;
 import org.example.portfolio.exception.InsufficientQuantityException;
 import org.example.portfolio.exception.InvalidAllocationException;
 import org.example.portfolio.exception.PortfolioAlreadyExistsException;
 import org.example.portfolio.exception.PortfolioNotFoundException;
 import org.example.portfolio.spi.AccountRepository;
 import org.example.portfolio.spi.PortfolioRepository;
+import org.example.portfolio.strategy.ProportionalRebalanceStrategy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -282,6 +284,37 @@ class DefaultPortfolioServiceTest {
         assertThrows(InsufficientQuantityException.class, () -> service.rebalanceAndApply(ACCOUNT));
 
         verify(repository, never()).replace(any(), any());
+    }
+
+    // ---- contention --------------------------------------------------------
+
+    @Test
+    void aRetriedRebalanceReusesItsPricesInsteadOfAskingTheMarketAgain() {
+        DefaultPortfolioService realStrategy =
+                new DefaultPortfolioService(repository, accounts, marketData, new ProportionalRebalanceStrategy());
+        Portfolio current = stored(new Portfolio(ACCOUNT).addStock("META", 10, bd("500"))
+                .withTargetAllocation(TargetAllocation.of(Map.of("AAPL", bd("100")))));
+        when(marketData.getPrice("META")).thenReturn(bd("500"));
+        when(marketData.getPrice("AAPL")).thenReturn(bd("190"));
+        when(repository.replace(same(current), any())).thenReturn(false, false, true);
+
+        realStrategy.rebalanceAndApply(ACCOUNT);
+
+        verify(repository, times(3)).replace(same(current), any());
+        verify(marketData, times(1)).getPrice("META");
+        verify(marketData, times(1)).getPrice("AAPL");
+    }
+
+    @Test
+    void anUpdateThatKeepsLosingTheRaceGivesUp() {
+        stored(new Portfolio(ACCOUNT));
+        when(repository.replace(any(), any())).thenReturn(false);
+
+        ConcurrentUpdateException e =
+                assertThrows(ConcurrentUpdateException.class, () -> service.addStock(ACCOUNT, "META", 1, bd("500")));
+
+        assertTrue(e.getMessage().contains("after " + DefaultPortfolioService.MAX_COMMIT_ATTEMPTS + " attempts"));
+        verify(repository, times(DefaultPortfolioService.MAX_COMMIT_ATTEMPTS)).replace(any(), any());
     }
 
     // ---- construction ------------------------------------------------------

@@ -25,6 +25,10 @@ public class MockMarketDataProvider implements MarketDataProvider {
         return provider;
     }
 
+    /**
+     * @param ticker normalised ticker symbol (upper case, e.g. {@code "IBM"}), as the service asks
+     *               for it; {@code "ibm"} would be stored as a different, never-requested ticker
+     */
     public void setPrice(String ticker, BigDecimal price) {
         if (price == null || price.signum() <= 0) {
             throw new IllegalArgumentException("Price must be positive: " + price);

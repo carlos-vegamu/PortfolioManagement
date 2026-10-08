@@ -5,7 +5,8 @@ import java.util.List;
 
 /**
  * The orders needed to bring a portfolio back to its target allocation. Sells are executed
- * before buys, so their proceeds can pay for the buys.
+ * before buys, so their proceeds can pay for the buys. The order lists are copied on
+ * construction, so a plan cannot change between being reported and being applied.
  */
 public record RebalancePlan(List<TradeAction> sells, List<TradeAction> buys) {
 

@@ -70,21 +70,24 @@ instance, so a change that fails half-way has no effect. The service commits a c
 `PortfolioRepository.replace(expected, updated)`, a compare-and-set; if another thread committed first, the change
 is re-run on the newer state. `createPortfolio` uses `saveIfAbsent`. The in-memory repository implements both with
 single atomic `ConcurrentHashMap` calls, so no locks are held while prices are fetched. Each operation reads every
-price at most once (`MarketPrices`), so all its calculations use the same quotes.
+price at most once (`MarketPrices`), before any retry, so all its calculations use the same quotes and a retry is pure
+computation that never waits on market data. An update that loses the race 1,000 times in a row fails with
+`ConcurrentUpdateException`, which callers can simply retry.
 
 ### Rebalancing rules (`ProportionalRebalanceStrategy`)
 
 - Self-financing and value-conserving: the market value of the holdings plus the portfolio's cash is redistributed per the target percentages. Buys never cost more than the cash plus the sale proceeds, and whatever whole shares can't use stays in the portfolio as **cash**.
-- Whole shares only: each ticker first gets as many shares as fit in its target value; the leftover then buys one more share of the most underweight tickers (largest gap first) while it can afford them; anything still left cancels sells, so shares are never sold just to sit as cash.
+- Whole shares only: each ticker first gets as many shares as fit in its target value; the leftover then buys one more share of the underweight tickers whose gaps add up to the most it can afford (an exact, bounded search, so two cheaper shares that each close most of their gap beat one expensive share that overshoots); anything still left cancels sells, so shares are never sold just to sit as cash.
 - Holdings not in the target are sold completely.
-- Rebalancing again right after applying a plan (same prices) finds nothing to do. Small drift from the exact target remains, bounded by one share per ticker.
+- The plan leaves the least **drift** whole shares allow, drift being the total distance from the target summed over every ticker and the cash (whose target is zero). A ticker can stay more than one share over its target when no underweight ticker is affordable: selling it would only turn shares into idle cash, which is drift too.
+- Rebalancing again right after applying a plan (same prices) finds nothing to do.
 - An empty portfolio without cash yields an empty plan (nothing to distribute).
 - `add` and `sell` record trades settled outside the portfolio and don't touch the cash; only rebalancing does.
 - `rebalance` only computes the plan; `rebalance <account> apply` (or `PortfolioService.rebalanceAndApply`) also executes it, atomically and all-or-nothing: the plan is rejected if it sells more shares of a ticker, in total, than are held, or buys more than the cash can pay for.
 
 ## Tests and coverage
 
-141 unit tests, including concurrency tests (many threads on one account) and a seeded property test that checks every rebalance keeps the portfolio's value and leaves nothing to do on a second run. `Portfolio` is at 100% line, branch and method coverage, and the build enforces a minimum of 80% (`make coverage`).
+149 unit tests, including concurrency tests (many threads on one account, and rebalances racing constant writes behind a slow market feed) and a seeded property test that checks every rebalance keeps the portfolio's value, reaches the least possible drift (against a brute-force search) and leaves nothing to do on a second run. `Portfolio` is at 100% line, branch and method coverage, and the build enforces a minimum of 80% (`make coverage`).
 
 ---
 

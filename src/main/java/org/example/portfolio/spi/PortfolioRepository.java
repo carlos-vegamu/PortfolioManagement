@@ -21,7 +21,8 @@ public interface PortfolioRepository {
 
     /**
      * Compare-and-set: stores {@code updated} only if {@code expected} is still the stored
-     * portfolio of the account.
+     * portfolio of the account. In memory that is an identity comparison ({@code Portfolio}
+     * deliberately keeps identity equality); a database implementation would compare a version.
      *
      * @return {@code false}, storing nothing, if another update was stored since {@code expected} was read
      */

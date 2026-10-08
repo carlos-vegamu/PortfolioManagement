@@ -100,6 +100,17 @@ class PortfolioCliTest {
     }
 
     @Test
+    void rebalanceSpreadsTheLeftoverInsteadOfOvershootingOneStock() {
+        // the default prices: 950 from 5 AAPL buys 1 META (500) + 1 MSFT (420), not a single NVDA (900)
+        String out = run("create acc1", "add acc1 AAPL 5 190", "target acc1 META=33 MSFT=33 NVDA=34", "rebalance acc1 apply");
+
+        assertTrue(out.contains("BUY       1 META"), out);
+        assertTrue(out.contains("BUY       1 MSFT"), out);
+        assertFalse(out.contains("BUY       1 NVDA"), out);
+        assertTrue(out.contains("Net cash: +$30.00"), out);
+    }
+
+    @Test
     void rebalanceNeverSellsSharesItCannotReinvest() {
         String out = run("create acc1", "add acc1 AAPL 3 190", "target acc1 AAPL=50 NVDA=50", "rebalance acc1 apply", "show acc1");
 
