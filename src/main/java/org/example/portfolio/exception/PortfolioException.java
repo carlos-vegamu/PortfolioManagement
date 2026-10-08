@@ -1,6 +1,9 @@
 package org.example.portfolio.exception;
 
-/** Base type for every business-rule violation raised by the portfolio module. */
+/**
+ * Base type for the failures the portfolio module reports to its callers: business-rule
+ * violations, plus {@link ConcurrentUpdateException}, which is contention and can be retried.
+ */
 public class PortfolioException extends RuntimeException {
 
     public PortfolioException(String message) {

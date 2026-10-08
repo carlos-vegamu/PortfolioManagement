@@ -258,11 +258,106 @@ class ProportionalRebalanceStrategyTest {
                 assertEquals(0, valueBefore.compareTo(after.getTotalValue(prices)), "value changed in " + context);
                 assertTrue(after.rebalance(strategy, prices).isEmpty(), "second rebalance not empty in " + context);
                 assertNothingAffordableLeftUndone(after, plan, prices, context);
-                assertEquals(0, leastPossibleDrift(portfolio, prices).compareTo(drift(after, prices)),
-                        "drift is not the least possible in " + context);
+                assertEquals(0, leastDriftKeepingFittingShares(portfolio, prices).compareTo(drift(after, prices)),
+                        "drift is not the least among plans keeping the fitting shares in " + context);
                 portfolio = after;
             }
         }
+    }
+
+    @Test
+    void whenTheSearchStopsEarlyItStillSpendsWhatItCanByGapPerPrice() {
+        // the case above, with a search allowed a single step: AAA then BBB by gap per price, DDD unaffordable
+        Map<String, BigDecimal> priceTable = Map.of("AAA", bd("100"), "BBB", bd("1000"), "DDD", bd("5000"));
+        MarketPrices prices = MarketPrices.of(priceTable);
+        Portfolio portfolio = new Portfolio("acc").addStock("DDD", 2, BigDecimal.ONE)
+                .withTargetAllocation(target("AAA", "0.95", "BBB", "9", "DDD", "90.05"));
+
+        RebalancePlan plan = portfolio.rebalance(new ProportionalRebalanceStrategy(1), prices);
+        Portfolio after = portfolio.applyRebalance(plan);
+
+        assertEquals(List.of(new TradeAction("DDD", TradeSide.SELL, 1, bd("5000"))), plan.sells());
+        assertEquals(List.of(
+                new TradeAction("AAA", TradeSide.BUY, 1, bd("100")),
+                new TradeAction("BBB", TradeSide.BUY, 1, bd("1000"))), plan.buys());
+        assertNothingAffordableLeftUndone(after, plan, prices, "a one-step search");
+    }
+
+    @Test
+    void portfoliosOfTenToTwentyStocksAtMixedPricesStayCorrectAndBeatGreedy() {
+        Random random = new Random(1_000_000);
+        ProportionalRebalanceStrategy exhaustive = new ProportionalRebalanceStrategy(Integer.MAX_VALUE);
+        ProportionalRebalanceStrategy greedy = new ProportionalRebalanceStrategy(0);
+        int exactRuns = 0;
+        for (int run = 0; run < 200; run++) {
+            boolean typicalPrices = run % 2 == 0;
+            List<String> universe = new ArrayList<>();
+            Map<String, BigDecimal> priceTable = new HashMap<>();
+            for (int i = 0, size = 10 + random.nextInt(11); i < size; i++) {
+                String ticker = "S" + i;
+                universe.add(ticker);
+                // typical: 1.00 to 999.99; mixed: anywhere from 0.01 to about 1,000,000
+                BigDecimal price = typicalPrices
+                        ? BigDecimal.valueOf(100 + random.nextInt(99_900), 2)
+                        : BigDecimal.valueOf(1 + random.nextInt(999), 2).movePointRight(random.nextInt(7));
+                priceTable.put(ticker, price);
+            }
+            MarketPrices prices = MarketPrices.of(priceTable);
+            Portfolio portfolio = new Portfolio("acc");
+            for (String ticker : universe) {
+                if (random.nextInt(3) == 0) {
+                    portfolio = portfolio.addStock(ticker, 1 + random.nextInt(2_000), BigDecimal.ONE);
+                }
+            }
+            if (portfolio.getStocks().isEmpty()) {
+                portfolio = portfolio.addStock(universe.get(0), 1 + random.nextInt(2_000), BigDecimal.ONE);
+            }
+            portfolio = portfolio.withTargetAllocation(randomTarget(random, universe, universe.size()));
+            String context = "run " + run + ": " + portfolio.getStocks() + " target "
+                    + portfolio.getTargetAllocation().orElseThrow() + " prices " + priceTable;
+
+            RebalancePlan plan = portfolio.rebalance(strategy, prices);
+            Portfolio after = portfolio.applyRebalance(plan);
+
+            assertEquals(0, portfolio.getTotalValue(prices).compareTo(after.getTotalValue(prices)), "value changed in " + context);
+            assertTrue(after.rebalance(strategy, prices).isEmpty(), "second rebalance not empty in " + context);
+            assertNothingAffordableLeftUndone(after, plan, prices, context);
+            BigDecimal drift = drift(after, prices);
+            BigDecimal greedyDrift = drift(portfolio.applyRebalance(portfolio.rebalance(greedy, prices)), prices);
+            BigDecimal leastDrift = drift(portfolio.applyRebalance(portfolio.rebalance(exhaustive, prices)), prices);
+            assertTrue(drift.compareTo(greedyDrift) <= 0, "worse than greedy in " + context);
+            assertTrue(drift.compareTo(leastDrift) >= 0, "better than the exhaustive search in " + context);
+            if (typicalPrices) {
+                assertEquals(0, drift.compareTo(leastDrift), "not exact at typical prices in " + context);
+            }
+            exactRuns += drift.compareTo(leastDrift) == 0 ? 1 : 0;
+        }
+        assertTrue(exactRuns >= 190, "exact in only " + exactRuns + " of 200 runs");
+    }
+
+    @Test
+    void moreThanAThousandUnderweightStocksSkipTheSearchButStillSpendTheLeftover() {
+        Random random = new Random(42);
+        List<String> universe = new ArrayList<>();
+        Map<String, BigDecimal> priceTable = new HashMap<>();
+        Map<String, BigDecimal> percentages = new HashMap<>();
+        for (int i = 0; i < 1_200; i++) {
+            String ticker = "T" + i;
+            universe.add(ticker);
+            priceTable.put(ticker, BigDecimal.valueOf(100 + random.nextInt(99_900), 2));
+            percentages.put(ticker, i == 0 ? bd("4.08") : bd("0.08"));
+        }
+        MarketPrices prices = MarketPrices.of(priceTable);
+        Portfolio portfolio = new Portfolio("acc").addStock("T0", 2_000_000, BigDecimal.ONE)
+                .withTargetAllocation(TargetAllocation.of(percentages));
+
+        RebalancePlan plan = portfolio.rebalance(strategy, prices);
+        Portfolio after = portfolio.applyRebalance(plan);
+
+        assertTrue(plan.buys().size() > 1_000, plan.buys().size() + " buys");
+        assertEquals(0, portfolio.getTotalValue(prices).compareTo(after.getTotalValue(prices)));
+        assertTrue(after.rebalance(strategy, prices).isEmpty());
+        assertNothingAffordableLeftUndone(after, plan, prices, "1,200 stocks");
     }
 
     /** No underweight target stock could take one more share, and no target stock was sold just to keep cash. */
@@ -302,9 +397,11 @@ class ProportionalRebalanceStrategyTest {
 
     /**
      * Brute force over every set of target tickers that could get one share more than fits in
-     * their target value: the least drift any whole-share rebalance of {@code portfolio} can reach.
+     * their target value: the least drift a rebalance of {@code portfolio} can reach while keeping,
+     * for each ticker, at least the whole shares that fit its target. That is what the strategy
+     * promises; giving up such a share to fund another ticker can do better and is not considered.
      */
-    private static BigDecimal leastPossibleDrift(Portfolio portfolio, MarketPrices prices) {
+    private static BigDecimal leastDriftKeepingFittingShares(Portfolio portfolio, MarketPrices prices) {
         BigDecimal total = portfolio.getTotalValue(prices);
         List<BigDecimal> shortfalls = new ArrayList<>();
         List<BigDecimal> sharePrices = new ArrayList<>();
@@ -336,9 +433,13 @@ class ProportionalRebalanceStrategyTest {
 
     /** 1 to 4 tickers whose percentages (two decimals) add up to exactly 100. */
     private static TargetAllocation randomTarget(Random random, List<String> universe) {
+        return randomTarget(random, universe, 1 + random.nextInt(4));
+    }
+
+    /** {@code size} tickers whose percentages (two decimals) add up to exactly 100. */
+    private static TargetAllocation randomTarget(Random random, List<String> universe, int size) {
         List<String> shuffled = new ArrayList<>(universe);
         Collections.shuffle(shuffled, random);
-        int size = 1 + random.nextInt(4);
         TreeSet<Integer> cuts = new TreeSet<>();
         while (cuts.size() < size - 1) {
             cuts.add(1 + random.nextInt(9_999));

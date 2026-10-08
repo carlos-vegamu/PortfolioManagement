@@ -71,15 +71,17 @@ instance, so a change that fails half-way has no effect. The service commits a c
 is re-run on the newer state. `createPortfolio` uses `saveIfAbsent`. The in-memory repository implements both with
 single atomic `ConcurrentHashMap` calls, so no locks are held while prices are fetched. Each operation reads every
 price at most once (`MarketPrices`), before any retry, so all its calculations use the same quotes and a retry is pure
-computation that never waits on market data. An update that loses the race 1,000 times in a row fails with
-`ConcurrentUpdateException`, which callers can simply retry.
+computation that never waits on market data. After each lost race the thread backs off for a random, exponentially
+growing pause (up to 1 ms), so writers racing for one account spread out instead of colliding again. An update that
+still loses the race 1,000 times in a row fails with `ConcurrentUpdateException`, which callers can simply retry.
 
 ### Rebalancing rules (`ProportionalRebalanceStrategy`)
 
 - Self-financing and value-conserving: the market value of the holdings plus the portfolio's cash is redistributed per the target percentages. Buys never cost more than the cash plus the sale proceeds, and whatever whole shares can't use stays in the portfolio as **cash**.
-- Whole shares only: each ticker first gets as many shares as fit in its target value; the leftover then buys one more share of the underweight tickers whose gaps add up to the most it can afford (an exact, bounded search, so two cheaper shares that each close most of their gap beat one expensive share that overshoots); anything still left cancels sells, so shares are never sold just to sit as cash.
+- Whole shares only: each ticker first gets as many shares as fit in its target value; the leftover then buys one more share of the underweight tickers whose gaps add up to the most it can afford (a bounded branch-and-bound search, so two cheaper shares that each close most of their gap beat one expensive share that overshoots; beyond 1,000 underweight stocks the search is skipped and shares go by gap per price); anything still left cancels sells, so shares are never sold just to sit as cash.
 - Holdings not in the target are sold completely.
-- The plan leaves the least **drift** whole shares allow, drift being the total distance from the target summed over every ticker and the cash (whose target is zero). A ticker can stay more than one share over its target when no underweight ticker is affordable: selling it would only turn shares into idle cash, which is drift too.
+- **Drift** is the total distance from the target, summed over every ticker and the cash (whose target is zero). Among plans that keep at least the whole shares fitting each target, the plan leaves the least drift whenever the search completes, which it does for typical portfolios of a few dozen stocks. A ticker can stay more than one share over its target when no underweight ticker is affordable: selling it would only turn shares into idle cash, which is drift too.
+- Known limitation: plans that give up a share fitting one ticker's target to fund a share of another are not considered, and can leave less drift. E.g. 2 META sold toward NVDA 80% / AMZN 20% keeps 2 AMZN and 64% cash, where giving up the AMZN share that fits would fund an NVDA and leave 10% cash. A wider search is a planned follow-up.
 - Rebalancing again right after applying a plan (same prices) finds nothing to do.
 - An empty portfolio without cash yields an empty plan (nothing to distribute).
 - `add` and `sell` record trades settled outside the portfolio and don't touch the cash; only rebalancing does.
@@ -87,7 +89,7 @@ computation that never waits on market data. An update that loses the race 1,000
 
 ## Tests and coverage
 
-149 unit tests, including concurrency tests (many threads on one account, and rebalances racing constant writes behind a slow market feed) and a seeded property test that checks every rebalance keeps the portfolio's value, reaches the least possible drift (against a brute-force search) and leaves nothing to do on a second run. `Portfolio` is at 100% line, branch and method coverage, and the build enforces a minimum of 80% (`make coverage`).
+152 unit tests, including concurrency tests (many threads on one account, and rebalances racing constant writes behind a slow market feed) and seeded property tests that check every rebalance keeps the portfolio's value, leaves nothing to do on a second run, and reaches the least drift among plans keeping the fitting shares (against a brute-force search, and against an unbounded search for 10–20 stocks). `Portfolio` is at 100% line, branch and method coverage, and the build enforces a minimum of 80% (`make coverage`).
 
 ---
 

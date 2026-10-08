@@ -39,6 +39,7 @@ public interface PortfolioService {
      *
      * @throws PortfolioNotFoundException if the account has no portfolio
      * @throws IllegalArgumentException   for a malformed ticker or a non-positive quantity or price
+     * @throws ConcurrentUpdateException  if other updates to the account kept winning; safe to retry
      */
     PortfolioSnapshot addStock(String accountId, String ticker, long quantity, BigDecimal price);
 
@@ -47,6 +48,7 @@ public interface PortfolioService {
      *
      * @throws PortfolioNotFoundException     if the account has no portfolio
      * @throws InsufficientQuantityException  if fewer shares are held than requested
+     * @throws ConcurrentUpdateException      if other updates to the account kept winning; safe to retry
      */
     PortfolioSnapshot sellStock(String accountId, String ticker, long quantity);
 
@@ -55,6 +57,7 @@ public interface PortfolioService {
      *
      * @throws PortfolioNotFoundException  if the account has no portfolio
      * @throws InvalidAllocationException  if the percentages are invalid
+     * @throws ConcurrentUpdateException   if other updates to the account kept winning; safe to retry
      */
     PortfolioSnapshot setTargetAllocation(String accountId, Map<String, BigDecimal> percentagesByTicker);
 
@@ -80,6 +83,8 @@ public interface PortfolioService {
      * Same as {@link #rebalance(String)} but also executes the plan, atomically: the plan is
      * computed from and applied to the same state. Sale proceeds not spent on whole shares stay
      * in the portfolio as cash.
+     *
+     * @throws ConcurrentUpdateException if other updates to the account kept winning; safe to retry
      */
     RebalancePlan rebalanceAndApply(String accountId);
 }

@@ -241,7 +241,7 @@ sequenceDiagram
     User->>CLI: rebalance acc1 apply
     CLI->>Svc: rebalanceAndApply("acc1")
     Note over Svc: prices = new MarketPrices for this call,<br/>shared by every attempt below
-    loop until the commit succeeds (at most 1,000 attempts)
+    loop until the commit succeeds (at most 1,000 attempts, random exponential backoff between them)
         Svc->>Repo: findByAccountId("acc1")
         Repo-->>Svc: current Portfolio (or PortfolioNotFoundException)
         Svc->>PF: rebalance(strategy, prices)
@@ -278,7 +278,9 @@ single `ConcurrentHashMap.replace(key, expected, updated)` call), so of two conc
 exactly one commits and the other is re-run on top of it: nothing is lost, and a plan is always applied to the
 state it was computed from. No lock is held while prices are fetched, and prices are fetched once per call, not per
 attempt, so a retry is pure computation: a slow market feed cannot make a rebalance lose every race against faster
-writers. An update still losing after 1,000 attempts gives up with `ConcurrentUpdateException`.
+writers. After each lost race the thread waits a random pause below a ceiling that doubles every time (64 ns up to
+1 ms, "full jitter"), so writers racing for one account spread out instead of colliding again; an update still losing
+after 1,000 attempts gives up with `ConcurrentUpdateException`, which is safe to retry.
 
 ---
 
@@ -322,14 +324,22 @@ flowchart TD
 the drift by 2 × gap and costs one share price, so step 2 is a 0/1 knapsack: the affordable set of extra shares with
 the largest total gap. Taking the largest gap first is not enough, because one expensive share can block two cheaper
 ones that close more (5 AAPL for META 33 / MSFT 33 / NVDA 34 ends 94.7% NVDA that way, instead of one META plus one
-MSFT). Branch and bound over the tickers, sorted by gap per price, finds the best set exactly; its search is capped
-at 10,000 steps, far beyond any realistic portfolio. Step 3 does not change the drift, since unsold shares and idle
+MSFT). Branch and bound over the tickers, sorted by gap per price and pruned with the fractional knapsack bound,
+finds the best set exactly for typical portfolios of a few dozen stocks. Its search is capped at 10,000 steps, which
+many tickers at very mixed prices can exceed; the plan then uses the best set found so far, never worse than taking
+shares by gap per price. Beyond 1,000 underweight tickers the search is skipped altogether (a portfolio that large is
+better served by an index fund). Step 3 does not change the drift, since unsold shares and idle
 cash count the same, but saves trades. That is also why a ticker can stay more than one share over its target: when
 no underweight ticker is affordable, selling it would only move money into cash.
 
 All arithmetic is exact (`BigDecimal`), so the value of the holdings plus the cash is the same before and after a
-plan is applied, the plan reaches the least drift whole shares allow, and planning again at the same prices gives
-an empty plan. Cost is O(n log n) for n tickers plus the bounded search, with one price lookup per ticker.
+plan is applied, and planning again at the same prices gives an empty plan. Among plans that keep at least the
+whole shares fitting each target, the plan leaves the least drift whenever the search completes.
+
+**Known limitation.** Giving up a share that fits one ticker's target, to fund a share of another, is not considered,
+and can leave less drift: 2 META sold toward NVDA 80% / AMZN 20% at 900 / 180 keeps 2 AMZN and 64% cash, where giving
+up the one AMZN share that fits would fund an NVDA and leave 10% cash. A wider search (allowing fewer shares than fit)
+is a planned follow-up. Cost is O(n log n) for n tickers plus the bounded search, with one price lookup per ticker.
 
 ---
 

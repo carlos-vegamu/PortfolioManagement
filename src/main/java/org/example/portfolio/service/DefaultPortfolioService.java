@@ -3,6 +3,9 @@ package org.example.portfolio.service;
 import java.math.BigDecimal;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -34,14 +37,18 @@ import org.slf4j.LoggerFactory;
  * from the stored one and commits it with {@link PortfolioRepository#replace} (compare-and-set);
  * if another thread committed first, the change is re-run on the newer state. Every operation
  * therefore reads, and commits, one consistent state of the account. Prices are read once per
- * operation, before any retry, so a retry is pure computation and never waits on market data;
- * after {@value #MAX_COMMIT_ATTEMPTS} lost races the operation fails with
- * {@link ConcurrentUpdateException}.
+ * operation, before any retry, so a retry is pure computation and never waits on market data.
+ * After each lost race the thread backs off for a random, exponentially growing pause (up to
+ * 1 ms), so writers racing for one account spread out instead of colliding again; after
+ * {@value #MAX_COMMIT_ATTEMPTS} lost races the operation fails with {@link ConcurrentUpdateException}.
  */
 public class DefaultPortfolioService implements PortfolioService {
 
-    /** Commits to try before giving up; only reached under pathological contention. */
+    /** Commits to try before giving up. With the backoff, a few dozen lost races in a row is already rare. */
     static final int MAX_COMMIT_ATTEMPTS = 1_000;
+
+    private static final long MIN_BACKOFF_NANOS = 64;
+    private static final long MAX_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
 
     private static final Logger LOG = LoggerFactory.getLogger(DefaultPortfolioService.class);
 
@@ -172,7 +179,14 @@ public class DefaultPortfolioService implements PortfolioService {
                 throw new ConcurrentUpdateException(current.getAccountId(), attempt);
             }
             LOG.debug("Account {}: concurrent update detected, retrying", current.getAccountId());
+            backOff(attempt);
         }
+    }
+
+    /** Waits a random time below a ceiling that doubles with every lost race, up to 1 ms ("full jitter"). */
+    private static void backOff(int lostRaces) {
+        long ceiling = Math.min(MAX_BACKOFF_NANOS, MIN_BACKOFF_NANOS << Math.min(lostRaces, 20));
+        LockSupport.parkNanos(1 + ThreadLocalRandom.current().nextLong(ceiling));
     }
 
     private Portfolio load(String accountId) {
@@ -187,12 +201,16 @@ public class DefaultPortfolioService implements PortfolioService {
 
     /**
      * Runs an operation and records a failure once, at the boundary, before rethrowing it:
-     * rejected business rules at WARN, malformed input at INFO, anything else at ERROR with
-     * its stack trace.
+     * rejected business rules and giving up under contention at WARN, malformed input at INFO,
+     * anything else at ERROR with its stack trace.
      */
     private <T> T logged(String accountId, String operation, Supplier<T> body) {
         try {
             return body.get();
+        } catch (ConcurrentUpdateException e) {
+            LOG.warn("Operation '{}' for account {} gave up under contention (retryable): {}",
+                    operation, accountId, e.getMessage());
+            throw e;
         } catch (PortfolioException e) {
             LOG.warn("Operation '{}' rejected for account {}: {}", operation, accountId, e.getMessage());
             throw e;
