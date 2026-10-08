@@ -39,3 +39,4 @@ build/
 .DS_Store
 ### IntelliJ IDEA project dir ###
 .idea/
+logs/
