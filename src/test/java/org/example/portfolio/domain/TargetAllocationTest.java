@@ -107,4 +107,15 @@ class TargetAllocationTest {
         assertNotEquals(a, "not an allocation");
         assertEquals("{AAPL=60, META=40}", a.toString());
     }
+
+    @Test
+    void percentagesAreStoredWithoutTrailingZeros() {
+        TargetAllocation allocation = TargetAllocation.of(Map.of("META", bd("33.330"), "AAPL", bd("66.670")));
+        TargetAllocation whole = TargetAllocation.of(Map.of("META", bd("100.00")));
+
+        assertEquals(bd("33.33"), allocation.asMap().get("META"));
+        assertEquals(bd("66.67"), allocation.asMap().get("AAPL"));
+        assertEquals(bd("100"), whole.asMap().get("META"));
+        assertEquals("{META=100}", whole.toString());
+    }
 }

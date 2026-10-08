@@ -24,7 +24,7 @@ create <account>                      create the account's portfolio (one per ac
 add <account> <ticker> <qty> <price>  buy shares; repeated buys update the average price
 sell <account> <ticker> <qty>         sell shares
 target <account> <TICKER=PCT> ...     e.g. target acc1 META=40 AAPL=60   (must add up to 100)
-show <account>                        holdings and target
+show <account>                        holdings, cash and target
 allocation <account>                  current vs. target allocation
 rebalance <account> [apply]           show the buys/sells needed; 'apply' also executes them
 help | exit
@@ -45,34 +45,46 @@ Full diagrams (layers, domain model, rebalance flow, algorithm, error handling) 
 org.example.portfolio
 ├── api       PortfolioService            contract consumed by the main application
 ├── spi       PortfolioRepository,        contracts implemented by other modules (persistence, accounts)
-│             AccountDirectory
-├── domain    Portfolio (aggregate), Stock, TargetAllocation, RebalancePlan, TradeAction, PortfolioSnapshot,
-│             MarketDataProvider, RebalanceStrategy   (ports the domain depends on)
-├── service   DefaultPortfolioService, ProportionalRebalanceStrategy
-├── infra     InMemoryPortfolioRepository, MockMarketDataProvider, MockAccountDirectory   (mocks of external services)
+│             AccountRepository
+├── domain    Portfolio (immutable aggregate), Stock, TargetAllocation, RebalancePlan, TradeAction,
+│             PortfolioSnapshot, AllocationReport, MarketPrices, RebalanceStrategy (policy port)
+├── service   DefaultPortfolioService, MarketDataProvider (contract with the market-data service)
+├── strategy  ProportionalRebalanceStrategy
+├── infra     InMemoryPortfolioRepository, MockMarketDataProvider, MockAccountRepository   (mocks of external services)
 ├── cli       PortfolioCli
 └── exception PortfolioException and subclasses
 org.example.Main                          composition root
 ```
 
 - **SRP** – `Portfolio` guards its own invariants; use-case orchestration lives in the service, the buy/sell policy in a strategy, I/O in the CLI.
-- **OCP** – new rebalancing policies implement `RebalanceStrategy`; `Portfolio` doesn't change.
-- **LSP / ISP** – small, focused interfaces (`MarketDataProvider` has one method, `AccountDirectory` has one); every implementation, mocks included, honours the documented contract.
+- **OCP** – new rebalancing policies implement `RebalanceStrategy` and are passed to `Portfolio.rebalance`; `Portfolio` doesn't change.
+- **LSP / ISP** – small, focused interfaces (`MarketDataProvider` has one method, `AccountRepository` has one); every implementation, mocks included, honours the documented contract.
 - **DIP** – `Portfolio`, the service and the CLI depend on interfaces only; `Main` is the only place that picks implementations.
-- **Testability** – every collaborator is injected, so `Portfolio` is tested with Mockito mocks of `MarketDataProvider` and `RebalanceStrategy`. The CLI takes its input/output streams as constructor arguments.
+- **Testability** – the strategy and the prices are method arguments, so `Portfolio` is tested with Mockito mocks of `RebalanceStrategy` and of a price source. The CLI takes its input/output streams as constructor arguments.
 - The service returns immutable `PortfolioSnapshot`s so callers can't mutate the aggregate behind its back.
+
+### Thread safety
+
+`PortfolioService` is safe to call from several threads. `Portfolio` is immutable: every change returns a new
+instance, so a change that fails half-way has no effect. The service commits a change with
+`PortfolioRepository.replace(expected, updated)`, a compare-and-set; if another thread committed first, the change
+is re-run on the newer state. `createPortfolio` uses `saveIfAbsent`. The in-memory repository implements both with
+single atomic `ConcurrentHashMap` calls, so no locks are held while prices are fetched. Each operation reads every
+price at most once (`MarketPrices`), so all its calculations use the same quotes.
 
 ### Rebalancing rules (`ProportionalRebalanceStrategy`)
 
-- Self-financing: the portfolio's current market value is redistributed per the target percentages; no extra cash is assumed.
+- Self-financing and value-conserving: the market value of the holdings plus the portfolio's cash is redistributed per the target percentages. Buys never cost more than the cash plus the sale proceeds, and whatever whole shares can't use stays in the portfolio as **cash**.
+- Whole shares only: each ticker first gets as many shares as fit in its target value; the leftover then buys one more share of the most underweight tickers (largest gap first) while it can afford them; anything still left cancels sells, so shares are never sold just to sit as cash.
 - Holdings not in the target are sold completely.
-- Whole shares only: sells are rounded to the nearest share, buys are rounded down, and total buys are capped by the proceeds of the sells (largest gap first). Small residual drift is therefore expected.
-- An empty portfolio yields an empty plan (nothing to distribute).
-- `rebalance` only computes the plan; `rebalance <account> apply` (or `PortfolioService.rebalanceAndApply`) also updates the holdings.
+- Rebalancing again right after applying a plan (same prices) finds nothing to do. Small drift from the exact target remains, bounded by one share per ticker.
+- An empty portfolio without cash yields an empty plan (nothing to distribute).
+- `add` and `sell` record trades settled outside the portfolio and don't touch the cash; only rebalancing does.
+- `rebalance` only computes the plan; `rebalance <account> apply` (or `PortfolioService.rebalanceAndApply`) also executes it, atomically and all-or-nothing: the plan is rejected if it sells more shares of a ticker, in total, than are held, or buys more than the cash can pay for.
 
 ## Tests and coverage
 
-108 unit tests. `Portfolio` is at 100% line, branch and method coverage, and the build enforces a minimum of 80% (`make coverage`).
+141 unit tests, including concurrency tests (many threads on one account) and a seeded property test that checks every rebalance keeps the portfolio's value and leaves nothing to do on a second run. `Portfolio` is at 100% line, branch and method coverage, and the build enforces a minimum of 80% (`make coverage`).
 
 ---
 

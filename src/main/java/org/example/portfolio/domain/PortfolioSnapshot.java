@@ -2,22 +2,26 @@ package org.example.portfolio.domain;
 
 import java.math.BigDecimal;
 import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.Map;
-import java.util.Set;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.SortedMap;
+import java.util.TreeMap;
 
 /**
  * Read-only copy of a portfolio's state. This is what the service layer hands to
  * other modules so they can never mutate the aggregate behind its back.
  *
- * @param targetAllocation target percentages by ticker; empty when none has been defined
+ * @param stocks           positions by ticker, sorted
+ * @param cash             uninvested cash, e.g. rebalance proceeds that did not buy a whole share
+ * @param targetAllocation the target allocation, if one has been defined
  */
-public record PortfolioSnapshot(String accountId, Set<Stock> stocks, Map<String, BigDecimal> targetAllocation) {
+public record PortfolioSnapshot(String accountId, SortedMap<String, Stock> stocks, BigDecimal cash,
+                                Optional<TargetAllocation> targetAllocation) {
 
     public PortfolioSnapshot {
-        // copies keep the caller's iteration order (portfolio data is sorted by ticker)
-        stocks = Collections.unmodifiableSet(new LinkedHashSet<>(stocks));
-        targetAllocation = Collections.unmodifiableMap(new LinkedHashMap<>(targetAllocation));
+        Objects.requireNonNull(accountId, "accountId");
+        stocks = Collections.unmodifiableSortedMap(new TreeMap<>(stocks));
+        Objects.requireNonNull(cash, "cash");
+        Objects.requireNonNull(targetAllocation, "targetAllocation");
     }
 }

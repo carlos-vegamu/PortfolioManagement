@@ -3,55 +3,76 @@ package org.example.portfolio.domain;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.Collections;
-import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
+import java.util.SortedMap;
 import java.util.TreeMap;
 
+import org.example.portfolio.exception.InsufficientCashException;
 import org.example.portfolio.exception.InsufficientQuantityException;
 import org.example.portfolio.exception.InvalidAllocationException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
- * Aggregate holding the stocks owned by one account and the allocation it is aiming for.
+ * Aggregate holding the stocks owned by one account, its uninvested cash and the allocation
+ * it is aiming for.
  *
- * <p>The class only guards its own invariants (one position per ticker, positive
- * quantities, valid target). Prices come from an injected {@link MarketDataProvider}
- * and the buy/sell decision from an injected {@link RebalanceStrategy}, so both can be
- * replaced by test doubles. It is not thread-safe.
+ * <p>Immutable, so it can be shared between threads: every change returns a new portfolio and
+ * leaves this one untouched, which also means a change that fails half-way has no effect.
+ * The class only guards its own invariants (one position per ticker, positive quantities,
+ * non-negative cash, valid target); prices and the buy/sell policy are passed in by the caller.
+ *
+ * <p>Equality is identity on purpose: repositories rely on it to detect concurrent updates
+ * (see {@code PortfolioRepository#replace}).
  */
-public class Portfolio {
+public final class Portfolio {
 
-    private static final Logger LOG = LoggerFactory.getLogger(Portfolio.class);
     private static final int PERCENT_SCALE = 2;
 
     private final String accountId;
-    private final RebalanceStrategy rebalanceStrategy;
-    private final Map<String, Stock> stocks = new TreeMap<>();
-    private TargetAllocation targetAllocation;
+    private final SortedMap<String, Stock> stocks;
+    private final BigDecimal cash;
+    private final TargetAllocation targetAllocation;
 
-    public Portfolio(String accountId, RebalanceStrategy rebalanceStrategy) {
-        if (accountId == null || accountId.isBlank()) {
+    /** An empty portfolio, with no cash and no target allocation. */
+    public Portfolio(String accountId) {
+        this(normalizeAccountId(accountId), Collections.emptySortedMap(), BigDecimal.ZERO, null);
+    }
+
+    /** @param stocks an unmodifiable map nobody else holds a modifiable reference to */
+    private Portfolio(String accountId, SortedMap<String, Stock> stocks, BigDecimal cash,
+                      TargetAllocation targetAllocation) {
+        this.accountId = accountId;
+        this.stocks = stocks;
+        this.cash = cash;
+        this.targetAllocation = targetAllocation;
+    }
+
+    /** Trims an account id, rejecting a blank one. */
+    public static String normalizeAccountId(String raw) {
+        if (raw == null || raw.isBlank()) {
             throw new IllegalArgumentException("Account id must not be blank");
         }
-        this.accountId = accountId.trim();
-        this.rebalanceStrategy = Objects.requireNonNull(rebalanceStrategy, "rebalanceStrategy");
+        return raw.trim();
     }
 
     public String getAccountId() {
         return accountId;
     }
 
-    /** Current positions, sorted by ticker. The returned set is unmodifiable. */
-    public Set<Stock> getStocks() {
-        return Collections.unmodifiableSet(new LinkedHashSet<>(stocks.values()));
+    /** Current positions by ticker, sorted. The returned map is unmodifiable. */
+    public SortedMap<String, Stock> getStocks() {
+        return stocks;
     }
 
     public Optional<Stock> findStock(String ticker) {
         return Optional.ofNullable(stocks.get(Stock.normalizeTicker(ticker)));
+    }
+
+    /** Uninvested cash: rebalance proceeds that were not spent on whole shares. Never negative. */
+    public BigDecimal getCash() {
+        return cash;
     }
 
     public Optional<TargetAllocation> getTargetAllocation() {
@@ -59,53 +80,46 @@ public class Portfolio {
     }
 
     /**
-     * Buys shares. If the ticker is already held the position grows and its average
-     * purchase price becomes the weighted average of old and new purchases.
+     * Records a purchase paid for outside the portfolio, so the cash is unchanged. If the ticker
+     * is already held the position grows and its average purchase price becomes the weighted
+     * average of old and new purchases.
+     *
+     * @return the portfolio after the purchase
      */
-    public void addStock(String ticker, long quantity, BigDecimal price) {
+    public Portfolio addStock(String ticker, long quantity, BigDecimal price) {
         String symbol = Stock.normalizeTicker(ticker);
-        Stock existing = stocks.get(symbol);
-        Stock updated = existing == null
-                ? new Stock(symbol, quantity, price)
-                : existing.increaseBy(quantity, price);
-        stocks.put(symbol, updated);
-        LOG.info("Account {}: bought {} {} @ {} -> holding {} @ avg {}",
-                accountId, quantity, symbol, price, updated.quantity(), updated.averagePurchasePrice());
+        Stock updated = bought(stocks.get(symbol), symbol, quantity, price);
+        SortedMap<String, Stock> next = new TreeMap<>(stocks);
+        next.put(symbol, updated);
+        return withStocks(next, cash);
     }
 
     /**
-     * Sells shares; the position disappears when fully sold.
+     * Records a sale whose proceeds leave the portfolio, so the cash is unchanged. The position
+     * disappears when fully sold.
      *
+     * @return the portfolio after the sale
      * @throws InsufficientQuantityException if fewer shares are held than requested
      */
-    public void sellStock(String ticker, long quantity) {
+    public Portfolio sellStock(String ticker, long quantity) {
         String symbol = Stock.normalizeTicker(ticker);
         if (quantity <= 0) {
             throw new IllegalArgumentException("Quantity must be positive: " + quantity);
         }
-        Stock existing = stocks.get(symbol);
-        long held = existing == null ? 0 : existing.quantity();
-        if (quantity > held) {
-            LOG.warn("Account {}: rejected sale of {} {} (held {})", accountId, quantity, symbol, held);
-            throw new InsufficientQuantityException(symbol, quantity, held);
-        }
-        if (quantity == held) {
-            stocks.remove(symbol);
-        } else {
-            stocks.put(symbol, existing.decreaseBy(quantity));
-        }
-        LOG.info("Account {}: sold {} {} ({} left)", accountId, quantity, symbol, held - quantity);
+        requireHeld(symbol, quantity);
+        SortedMap<String, Stock> next = new TreeMap<>(stocks);
+        sold(next, symbol, quantity);
+        return withStocks(next, cash);
     }
 
-    /** Defines the distribution this portfolio is aiming for, replacing any previous one. */
-    public void setTargetAllocation(TargetAllocation allocation) {
-        this.targetAllocation = Objects.requireNonNull(allocation, "allocation");
-        LOG.info("Account {}: target allocation set to {}", accountId, allocation);
+    /** @return the portfolio aiming for {@code allocation} instead of any previous target */
+    public Portfolio withTargetAllocation(TargetAllocation allocation) {
+        return new Portfolio(accountId, stocks, cash, Objects.requireNonNull(allocation, "allocation"));
     }
 
-    /** Market value of all positions. */
-    public BigDecimal getTotalValue(MarketDataProvider prices) {
-        BigDecimal total = BigDecimal.ZERO;
+    /** Market value of all positions plus the cash. */
+    public BigDecimal getTotalValue(MarketPrices prices) {
+        BigDecimal total = cash;
         for (Stock stock : stocks.values()) {
             total = total.add(marketValue(stock, prices));
         }
@@ -113,64 +127,109 @@ public class Portfolio {
     }
 
     /**
-     * Share of the total market value held in each stock, as percentages (scale 2),
-     * sorted by ticker. Empty when the portfolio is empty.
+     * How the total value (positions plus cash) is distributed, in percent (scale 2), next to
+     * the target. Each position is valued once. Empty when the portfolio holds nothing.
      */
-    public Map<String, BigDecimal> getCurrentAllocation(MarketDataProvider prices) {
-        Map<String, BigDecimal> allocation = new TreeMap<>();
-        BigDecimal total = getTotalValue(prices);
-        if (total.signum() == 0) {
-            return allocation;
-        }
+    public AllocationReport getCurrentAllocation(MarketPrices prices) {
+        SortedMap<String, BigDecimal> current = new TreeMap<>();
+        BigDecimal total = cash;
         for (Stock stock : stocks.values()) {
-            BigDecimal pct = marketValue(stock, prices)
-                    .multiply(TargetAllocation.HUNDRED)
-                    .divide(total, PERCENT_SCALE, RoundingMode.HALF_UP);
-            allocation.put(stock.ticker(), pct);
+            BigDecimal value = marketValue(stock, prices);
+            current.put(stock.ticker(), value);
+            total = total.add(value);
         }
-        return allocation;
+        BigDecimal cashPercentage = BigDecimal.ZERO.setScale(PERCENT_SCALE);
+        if (total.signum() != 0) {
+            BigDecimal denominator = total;
+            current.replaceAll((ticker, value) -> percentOf(value, denominator));
+            cashPercentage = percentOf(cash, denominator);
+        }
+        return new AllocationReport(current, cashPercentage, getTargetAllocation());
     }
 
     /**
-     * Works out which stocks to sell and which to buy to match the target allocation.
-     * The portfolio is not modified; use {@link #applyRebalance(RebalancePlan)} to execute the plan.
+     * Works out, with the given policy, which stocks to sell and which to buy to match the
+     * target allocation. The portfolio is not modified; use {@link #applyRebalance(RebalancePlan)}
+     * to execute the plan.
      *
      * @throws InvalidAllocationException if no target allocation has been defined
      */
-    public RebalancePlan rebalance(MarketDataProvider prices) {
+    public RebalancePlan rebalance(RebalanceStrategy strategy, MarketPrices prices) {
+        Objects.requireNonNull(strategy, "strategy");
         if (targetAllocation == null) {
-            LOG.warn("Account {}: rebalance requested without a target allocation", accountId);
             throw new InvalidAllocationException("Define a target allocation before rebalancing");
         }
-        RebalancePlan plan = rebalanceStrategy.plan(getStocks(), targetAllocation, prices);
-        LOG.info("Account {}: rebalance plan has {} sell(s) and {} buy(s)",
-                accountId, plan.sells().size(), plan.buys().size());
-        return plan;
+        return strategy.plan(stocks, cash, targetAllocation, prices);
     }
 
     /**
-     * Executes a plan: sells first, then buys. The plan is validated up front so a
-     * failing sale cannot leave the portfolio half-rebalanced.
+     * Executes a plan: sells first, crediting their proceeds to the cash, then buys, paid from
+     * the cash. The whole plan is checked before anything changes, so it is applied completely
+     * or not at all.
+     *
+     * @return the portfolio after the plan; this same portfolio when the plan is empty
+     * @throws InsufficientQuantityException if the plan sells more shares of a ticker, in total, than are held
+     * @throws InsufficientCashException     if the buys cost more than the cash plus the sale proceeds
      */
-    public void applyRebalance(RebalancePlan plan) {
-        for (TradeAction sell : plan.sells()) {
-            long held = findStock(sell.ticker()).map(Stock::quantity).orElse(0L);
-            if (sell.quantity() > held) {
-                throw new InsufficientQuantityException(sell.ticker(), sell.quantity(), held);
-            }
+    public Portfolio applyRebalance(RebalancePlan plan) {
+        if (plan.isEmpty()) {
+            return this;
         }
-        plan.sells().forEach(a -> sellStock(a.ticker(), a.quantity()));
-        plan.buys().forEach(a -> addStock(a.ticker(), a.quantity(), a.price()));
-        LOG.info("Account {}: rebalance applied ({} order(s))", accountId, plan.actions().size());
+        Map<String, Long> soldByTicker = new LinkedHashMap<>();
+        for (TradeAction sell : plan.sells()) {
+            soldByTicker.merge(sell.ticker(), sell.quantity(), Math::addExact);
+        }
+        soldByTicker.forEach(this::requireHeld);
+        BigDecimal available = cash.add(plan.proceeds());
+        BigDecimal cost = plan.cost();
+        if (cost.compareTo(available) > 0) {
+            throw new InsufficientCashException(cost, available);
+        }
+
+        SortedMap<String, Stock> next = new TreeMap<>(stocks);
+        soldByTicker.forEach((ticker, quantity) -> sold(next, ticker, quantity));
+        for (TradeAction buy : plan.buys()) {
+            next.put(buy.ticker(), bought(next.get(buy.ticker()), buy.ticker(), buy.quantity(), buy.price()));
+        }
+        return withStocks(next, available.subtract(cost));
     }
 
     /** Immutable copy of the current state. */
     public PortfolioSnapshot snapshot() {
-        Map<String, BigDecimal> target = targetAllocation == null ? Map.of() : targetAllocation.asMap();
-        return new PortfolioSnapshot(accountId, getStocks(), target);
+        return new PortfolioSnapshot(accountId, stocks, cash, getTargetAllocation());
     }
 
-    private static BigDecimal marketValue(Stock stock, MarketDataProvider prices) {
-        return prices.getPrice(stock.ticker()).multiply(BigDecimal.valueOf(stock.quantity()));
+    private Portfolio withStocks(SortedMap<String, Stock> next, BigDecimal newCash) {
+        return new Portfolio(accountId, Collections.unmodifiableSortedMap(next), newCash, targetAllocation);
+    }
+
+    private void requireHeld(String ticker, long quantity) {
+        Stock stock = stocks.get(ticker);
+        long held = stock == null ? 0 : stock.quantity();
+        if (quantity > held) {
+            throw new InsufficientQuantityException(ticker, quantity, held);
+        }
+    }
+
+    private static Stock bought(Stock held, String ticker, long quantity, BigDecimal price) {
+        return held == null ? new Stock(ticker, quantity, price) : held.increaseBy(quantity, price);
+    }
+
+    /** Removes {@code quantity} shares, known to be held, from {@code stocks}. */
+    private static void sold(SortedMap<String, Stock> stocks, String ticker, long quantity) {
+        Stock held = stocks.get(ticker);
+        if (quantity == held.quantity()) {
+            stocks.remove(ticker);
+        } else {
+            stocks.put(ticker, held.decreaseBy(quantity));
+        }
+    }
+
+    private static BigDecimal marketValue(Stock stock, MarketPrices prices) {
+        return prices.priceOf(stock.ticker()).multiply(BigDecimal.valueOf(stock.quantity()));
+    }
+
+    private static BigDecimal percentOf(BigDecimal part, BigDecimal total) {
+        return part.multiply(TargetAllocation.HUNDRED).divide(total, PERCENT_SCALE, RoundingMode.HALF_UP);
     }
 }

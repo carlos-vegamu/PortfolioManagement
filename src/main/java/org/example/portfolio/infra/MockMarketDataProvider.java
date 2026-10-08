@@ -4,10 +4,10 @@ import java.math.BigDecimal;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.example.portfolio.domain.MarketDataProvider;
 import org.example.portfolio.exception.PriceUnavailableException;
+import org.example.portfolio.service.MarketDataProvider;
 
-/** Stand-in for the external market-data service, backed by a fixed price table. */
+/** Stand-in for the external market-data service, backed by a thread-safe price table. */
 public class MockMarketDataProvider implements MarketDataProvider {
 
     private final Map<String, BigDecimal> prices = new ConcurrentHashMap<>();

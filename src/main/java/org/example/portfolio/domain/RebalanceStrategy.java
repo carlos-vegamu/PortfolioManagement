@@ -1,18 +1,21 @@
 package org.example.portfolio.domain;
 
-import java.util.Collection;
+import java.math.BigDecimal;
+import java.util.SortedMap;
 
 /**
- * Policy that decides which stocks to buy and sell. Injected into {@link Portfolio} so
+ * Policy that decides which stocks to buy and sell. Passed to {@link Portfolio#rebalance} so
  * alternative policies (thresholds, tax-aware, ...) can be added without touching it.
  */
 public interface RebalanceStrategy {
 
     /**
-     * @param holdings current positions
+     * @param holdings current positions by ticker
+     * @param cash     uninvested cash the plan may spend
      * @param target   desired distribution
-     * @param prices   source of current prices
-     * @return the orders required to reach {@code target}; empty when already balanced
+     * @param prices   prices for this operation
+     * @return the orders required to reach {@code target}, whose buys cost no more than {@code cash}
+     *         plus the proceeds of its sells; empty when already balanced
      */
-    RebalancePlan plan(Collection<Stock> holdings, TargetAllocation target, MarketDataProvider prices);
+    RebalancePlan plan(SortedMap<String, Stock> holdings, BigDecimal cash, TargetAllocation target, MarketPrices prices);
 }

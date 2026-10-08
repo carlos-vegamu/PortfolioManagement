@@ -1,12 +1,13 @@
-package org.example.portfolio.domain;
+package org.example.portfolio.service;
 
 import java.math.BigDecimal;
 
 import org.example.portfolio.exception.PriceUnavailableException;
 
 /**
- * Port to the external market-data service. Implemented by another module in the main
- * application; this module ships only a mock.
+ * Contract with the external market-data service, implemented by another module in the main
+ * application; this module ships only a mock. Implementations must be safe to call from
+ * several threads. The service asks for each price at most once per operation.
  */
 public interface MarketDataProvider {
 

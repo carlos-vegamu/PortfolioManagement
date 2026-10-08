@@ -1,11 +1,15 @@
 package org.example.portfolio.service;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.math.BigDecimal;
@@ -13,11 +17,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-import org.example.portfolio.domain.MarketDataProvider;
+import org.example.portfolio.domain.AllocationReport;
 import org.example.portfolio.domain.Portfolio;
 import org.example.portfolio.domain.PortfolioSnapshot;
 import org.example.portfolio.domain.RebalancePlan;
 import org.example.portfolio.domain.RebalanceStrategy;
+import org.example.portfolio.domain.TargetAllocation;
 import org.example.portfolio.domain.TradeAction;
 import org.example.portfolio.domain.TradeSide;
 import org.example.portfolio.exception.AccountNotFoundException;
@@ -25,7 +30,7 @@ import org.example.portfolio.exception.InsufficientQuantityException;
 import org.example.portfolio.exception.InvalidAllocationException;
 import org.example.portfolio.exception.PortfolioAlreadyExistsException;
 import org.example.portfolio.exception.PortfolioNotFoundException;
-import org.example.portfolio.spi.AccountDirectory;
+import org.example.portfolio.spi.AccountRepository;
 import org.example.portfolio.spi.PortfolioRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,7 +47,7 @@ class DefaultPortfolioServiceTest {
     @Mock
     private PortfolioRepository repository;
     @Mock
-    private AccountDirectory accounts;
+    private AccountRepository accounts;
     @Mock
     private MarketDataProvider marketData;
     @Mock
@@ -59,25 +64,35 @@ class DefaultPortfolioServiceTest {
         return new BigDecimal(v);
     }
 
-    private Portfolio existingPortfolio() {
-        Portfolio portfolio = new Portfolio(ACCOUNT, strategy);
+    private Portfolio stored(Portfolio portfolio) {
         when(repository.findByAccountId(ACCOUNT)).thenReturn(Optional.of(portfolio));
         return portfolio;
+    }
+
+    /** Lets the commit over {@code current} succeed. */
+    private void commitSucceedsOver(Portfolio current) {
+        when(repository.replace(same(current), any())).thenReturn(true);
+    }
+
+    private Portfolio committedOver(Portfolio current) {
+        ArgumentCaptor<Portfolio> committed = ArgumentCaptor.forClass(Portfolio.class);
+        verify(repository).replace(same(current), committed.capture());
+        return committed.getValue();
     }
 
     // ---- create ------------------------------------------------------------
 
     @Test
-    void createPortfolioSavesANewEmptyPortfolio() {
+    void createPortfolioStoresANewEmptyPortfolio() {
         when(accounts.exists(ACCOUNT)).thenReturn(true);
-        when(repository.findByAccountId(ACCOUNT)).thenReturn(Optional.empty());
+        when(repository.saveIfAbsent(any())).thenReturn(true);
 
         PortfolioSnapshot snapshot = service.createPortfolio("  " + ACCOUNT + " ");
 
         assertEquals(ACCOUNT, snapshot.accountId());
         assertTrue(snapshot.stocks().isEmpty());
         ArgumentCaptor<Portfolio> saved = ArgumentCaptor.forClass(Portfolio.class);
-        verify(repository).save(saved.capture());
+        verify(repository).saveIfAbsent(saved.capture());
         assertEquals(ACCOUNT, saved.getValue().getAccountId());
     }
 
@@ -87,30 +102,29 @@ class DefaultPortfolioServiceTest {
 
         assertThrows(AccountNotFoundException.class, () -> service.createPortfolio(ACCOUNT));
 
-        verify(repository, never()).save(any());
+        verify(repository, never()).saveIfAbsent(any());
     }
 
     @Test
     void anAccountCanOnlyHaveOnePortfolio() {
         when(accounts.exists(ACCOUNT)).thenReturn(true);
-        when(repository.findByAccountId(ACCOUNT)).thenReturn(Optional.of(new Portfolio(ACCOUNT, strategy)));
+        when(repository.saveIfAbsent(any())).thenReturn(false);
 
         assertThrows(PortfolioAlreadyExistsException.class, () -> service.createPortfolio(ACCOUNT));
-
-        verify(repository, never()).save(any());
     }
 
     @Test
     void blankAccountIdIsRejectedEverywhere() {
         assertThrows(IllegalArgumentException.class, () -> service.createPortfolio(" "));
         assertThrows(IllegalArgumentException.class, () -> service.getPortfolio(null));
+        verifyNoInteractions(repository, accounts);
     }
 
     // ---- read / update -----------------------------------------------------
 
     @Test
     void getPortfolioReturnsSnapshot() {
-        existingPortfolio().addStock("META", 3, bd("100"));
+        stored(new Portfolio(ACCOUNT).addStock("META", 3, bd("100")));
 
         assertEquals(1, service.getPortfolio(ACCOUNT).stocks().size());
     }
@@ -123,14 +137,30 @@ class DefaultPortfolioServiceTest {
     }
 
     @Test
-    void addStockUpdatesAndPersists() {
-        Portfolio portfolio = existingPortfolio();
+    void addStockCommitsTheUpdatedPortfolio() {
+        Portfolio current = stored(new Portfolio(ACCOUNT));
+        commitSucceedsOver(current);
 
         PortfolioSnapshot snapshot = service.addStock(ACCOUNT, "meta", 10, bd("500"));
 
-        assertEquals(1, snapshot.stocks().size());
-        assertEquals(10, portfolio.findStock("META").orElseThrow().quantity());
-        verify(repository).save(portfolio);
+        assertEquals(10, snapshot.stocks().get("META").quantity());
+        assertEquals(10, committedOver(current).findStock("META").orElseThrow().quantity());
+        assertTrue(current.getStocks().isEmpty(), "the stored portfolio itself is never modified");
+    }
+
+    @Test
+    void addStockIsRetriedOnTheNewerStateWhenAnotherUpdateWinsTheRace() {
+        Portfolio first = new Portfolio(ACCOUNT);
+        Portfolio concurrent = first.addStock("AAPL", 5, bd("190"));
+        when(repository.findByAccountId(ACCOUNT)).thenReturn(Optional.of(first), Optional.of(concurrent));
+        when(repository.replace(same(first), any())).thenReturn(false);
+        commitSucceedsOver(concurrent);
+
+        PortfolioSnapshot snapshot = service.addStock(ACCOUNT, "META", 10, bd("500"));
+
+        assertEquals(5, snapshot.stocks().get("AAPL").quantity(), "the concurrent purchase is kept");
+        assertEquals(10, snapshot.stocks().get("META").quantity());
+        verify(repository, times(2)).findByAccountId(ACCOUNT);
     }
 
     @Test
@@ -139,98 +169,119 @@ class DefaultPortfolioServiceTest {
 
         assertThrows(PortfolioNotFoundException.class, () -> service.addStock(ACCOUNT, "META", 1, bd("1")));
 
-        verify(repository, never()).save(any());
+        verify(repository, never()).replace(any(), any());
     }
 
     @Test
-    void sellStockUpdatesAndPersists() {
-        Portfolio portfolio = existingPortfolio();
-        portfolio.addStock("META", 10, bd("500"));
+    void sellStockCommitsTheUpdatedPortfolio() {
+        Portfolio current = stored(new Portfolio(ACCOUNT).addStock("META", 10, bd("500")));
+        commitSucceedsOver(current);
 
         service.sellStock(ACCOUNT, "META", 4);
 
-        assertEquals(6, portfolio.findStock("META").orElseThrow().quantity());
-        verify(repository).save(portfolio);
+        assertEquals(6, committedOver(current).findStock("META").orElseThrow().quantity());
     }
 
     @Test
-    void sellStockPropagatesBusinessErrorsWithoutSaving() {
-        existingPortfolio();
+    void sellStockPropagatesBusinessErrorsWithoutCommitting() {
+        stored(new Portfolio(ACCOUNT));
 
         assertThrows(InsufficientQuantityException.class, () -> service.sellStock(ACCOUNT, "META", 1));
 
-        verify(repository, never()).save(any());
+        verify(repository, never()).replace(any(), any());
     }
 
     @Test
-    void setTargetAllocationValidatesAndPersists() {
-        Portfolio portfolio = existingPortfolio();
+    void setTargetAllocationValidatesAndCommits() {
+        Portfolio current = stored(new Portfolio(ACCOUNT));
+        commitSucceedsOver(current);
 
         PortfolioSnapshot snapshot = service.setTargetAllocation(ACCOUNT, Map.of("META", bd("40"), "AAPL", bd("60")));
 
-        assertEquals(2, snapshot.targetAllocation().size());
-        assertTrue(portfolio.getTargetAllocation().isPresent());
-        verify(repository).save(portfolio);
+        assertEquals(2, snapshot.targetAllocation().orElseThrow().asMap().size());
+        assertTrue(committedOver(current).getTargetAllocation().isPresent());
     }
 
     @Test
-    void setTargetAllocationRejectsInvalidPercentages() {
-        existingPortfolio();
-
+    void setTargetAllocationRejectsInvalidPercentagesBeforeTouchingTheRepository() {
         assertThrows(InvalidAllocationException.class,
                 () -> service.setTargetAllocation(ACCOUNT, Map.of("META", bd("40"), "AAPL", bd("40"))));
 
-        verify(repository, never()).save(any());
+        verifyNoInteractions(repository);
     }
 
     // ---- allocation & rebalance --------------------------------------------
 
     @Test
-    void currentAllocationUsesMarketData() {
-        existingPortfolio().addStock("META", 10, bd("1"));
+    void currentAllocationAsksTheMarketDataOncePerTicker() {
+        stored(new Portfolio(ACCOUNT).addStock("META", 10, bd("1")));
         when(marketData.getPrice("META")).thenReturn(bd("500"));
 
-        Map<String, BigDecimal> allocation = service.getCurrentAllocation(ACCOUNT);
+        AllocationReport report = service.getCurrentAllocation(ACCOUNT);
 
-        assertEquals(bd("100.00"), allocation.get("META"));
+        assertEquals(bd("100.00"), report.current().get("META"));
+        verify(marketData, times(1)).getPrice("META");
     }
 
     @Test
-    void rebalanceReturnsPlanWithoutChangingHoldings() {
-        Portfolio portfolio = existingPortfolio();
-        portfolio.addStock("META", 10, bd("500"));
-        service.setTargetAllocation(ACCOUNT, Map.of("AAPL", bd("100")));
-        RebalancePlan plan = new RebalancePlan(List.of(new TradeAction("META", TradeSide.SELL, 10, bd("500"))));
-        when(strategy.plan(any(), any(), any())).thenReturn(plan);
+    void rebalanceReturnsPlanWithoutCommitting() {
+        stored(new Portfolio(ACCOUNT).addStock("META", 10, bd("500"))
+                .withTargetAllocation(TargetAllocation.of(Map.of("AAPL", bd("100")))));
+        RebalancePlan plan = new RebalancePlan(List.of(new TradeAction("META", TradeSide.SELL, 10, bd("500"))), List.of());
+        when(strategy.plan(any(), any(), any(), any())).thenReturn(plan);
 
         assertEquals(plan, service.rebalance(ACCOUNT));
 
-        assertEquals(10, portfolio.findStock("META").orElseThrow().quantity());
+        verify(repository, never()).replace(any(), any());
     }
 
     @Test
     void rebalanceWithoutTargetFails() {
-        existingPortfolio();
+        stored(new Portfolio(ACCOUNT));
 
         assertThrows(InvalidAllocationException.class, () -> service.rebalance(ACCOUNT));
     }
 
     @Test
-    void rebalanceAndApplyExecutesPlanAndPersists() {
-        Portfolio portfolio = existingPortfolio();
-        portfolio.addStock("META", 10, bd("500"));
-        portfolio.setTargetAllocation(org.example.portfolio.domain.TargetAllocation.of(Map.of("AAPL", bd("100"))));
-        RebalancePlan plan = new RebalancePlan(List.of(
-                new TradeAction("META", TradeSide.SELL, 10, bd("500")),
-                new TradeAction("AAPL", TradeSide.BUY, 26, bd("190"))));
-        when(strategy.plan(any(), any(), any())).thenReturn(plan);
+    void rebalanceAndApplyExecutesPlanAndCommits() {
+        Portfolio current = stored(new Portfolio(ACCOUNT).addStock("META", 10, bd("500"))
+                .withTargetAllocation(TargetAllocation.of(Map.of("AAPL", bd("100")))));
+        RebalancePlan plan = new RebalancePlan(
+                List.of(new TradeAction("META", TradeSide.SELL, 10, bd("500"))),
+                List.of(new TradeAction("AAPL", TradeSide.BUY, 26, bd("190"))));
+        when(strategy.plan(any(), any(), any(), any())).thenReturn(plan);
+        commitSucceedsOver(current);
 
         RebalancePlan result = service.rebalanceAndApply(ACCOUNT);
 
         assertEquals(plan, result);
-        assertTrue(portfolio.findStock("META").isEmpty());
-        assertEquals(26, portfolio.findStock("AAPL").orElseThrow().quantity());
-        verify(repository).save(portfolio);
+        Portfolio committed = committedOver(current);
+        assertTrue(committed.findStock("META").isEmpty());
+        assertEquals(26, committed.findStock("AAPL").orElseThrow().quantity());
+        assertEquals(0, bd("60").compareTo(committed.getCash()), "5,000 raised, 4,940 spent");
+    }
+
+    @Test
+    void rebalanceAndApplyWithNothingToDoCommitsNothing() {
+        stored(new Portfolio(ACCOUNT).addStock("META", 10, bd("500"))
+                .withTargetAllocation(TargetAllocation.of(Map.of("META", bd("100")))));
+        when(strategy.plan(any(), any(), any(), any())).thenReturn(RebalancePlan.empty());
+
+        assertSame(RebalancePlan.empty(), service.rebalanceAndApply(ACCOUNT));
+
+        verify(repository, never()).replace(any(), any());
+    }
+
+    @Test
+    void rebalanceAndApplyRejectsAPlanSellingMoreThanIsHeldInTotal() {
+        stored(new Portfolio(ACCOUNT).addStock("META", 10, bd("500"))
+                .withTargetAllocation(TargetAllocation.of(Map.of("AAPL", bd("100")))));
+        TradeAction sixMeta = new TradeAction("META", TradeSide.SELL, 6, bd("500"));
+        when(strategy.plan(any(), any(), any(), any())).thenReturn(new RebalancePlan(List.of(sixMeta, sixMeta), List.of()));
+
+        assertThrows(InsufficientQuantityException.class, () -> service.rebalanceAndApply(ACCOUNT));
+
+        verify(repository, never()).replace(any(), any());
     }
 
     // ---- construction ------------------------------------------------------

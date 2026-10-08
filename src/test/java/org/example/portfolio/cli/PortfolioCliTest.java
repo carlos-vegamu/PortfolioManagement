@@ -13,20 +13,19 @@ import java.io.PrintStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.Optional;
+import java.util.TreeMap;
 
 import org.example.portfolio.api.PortfolioService;
 import org.example.portfolio.domain.PortfolioSnapshot;
 import org.example.portfolio.domain.RebalancePlan;
-import org.example.portfolio.domain.Stock;
 import org.example.portfolio.domain.TradeAction;
 import org.example.portfolio.domain.TradeSide;
 import org.example.portfolio.infra.InMemoryPortfolioRepository;
-import org.example.portfolio.infra.MockAccountDirectory;
+import org.example.portfolio.infra.MockAccountRepository;
 import org.example.portfolio.infra.MockMarketDataProvider;
 import org.example.portfolio.service.DefaultPortfolioService;
-import org.example.portfolio.service.ProportionalRebalanceStrategy;
+import org.example.portfolio.strategy.ProportionalRebalanceStrategy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -39,7 +38,7 @@ class PortfolioCliTest {
     void setUp() {
         PortfolioService service = new DefaultPortfolioService(
                 new InMemoryPortfolioRepository(),
-                new MockAccountDirectory(),
+                new MockAccountRepository(),
                 MockMarketDataProvider.withDefaultPrices(),
                 new ProportionalRebalanceStrategy());
         cli = cliFor(service, "");
@@ -88,6 +87,27 @@ class PortfolioCliTest {
     }
 
     @Test
+    void rebalanceKeepsUnspentProceedsAsCash() {
+        String out = run("create acc1", "add acc1 AAPL 15 190", "target acc1 AAPL=50 NVDA=50",
+                "rebalance acc1 apply", "show acc1", "allocation acc1", "rebalance acc1");
+
+        assertTrue(out.contains("SELL      5 AAPL"), out);
+        assertTrue(out.contains("BUY       1 NVDA"), out);
+        assertTrue(out.contains("Net cash: +$50.00"), out);
+        assertTrue(out.contains("Cash: $50.00"), out);
+        assertTrue(out.contains("(cash)"), out);
+        assertTrue(out.contains("already balanced"), out);
+    }
+
+    @Test
+    void rebalanceNeverSellsSharesItCannotReinvest() {
+        String out = run("create acc1", "add acc1 AAPL 3 190", "target acc1 AAPL=50 NVDA=50", "rebalance acc1 apply", "show acc1");
+
+        assertTrue(out.contains("already balanced"), out);
+        assertTrue(out.contains("AAPL              3"), out);
+    }
+
+    @Test
     void secondPortfolioForSameAccountIsRejected() {
         String out = run("create acc1", "create acc1");
 
@@ -99,6 +119,14 @@ class PortfolioCliTest {
         String out = run("create acc1", "add acc1 META 100 10", "add acc1 META 100 20");
 
         assertTrue(out.contains("Holding: 200 shares @ avg $15.00"), out);
+    }
+
+    @Test
+    void tradesEchoTheParsedQuantity() {
+        String out = run("create acc1", "add acc1 META 007 10", "sell acc1 META 02");
+
+        assertTrue(out.contains("Bought 7 META. Holding: 7 shares"), out);
+        assertTrue(out.contains("Sold 2 META. 5 shares left"), out);
     }
 
     @Test
@@ -116,6 +144,7 @@ class PortfolioCliTest {
 
         assertTrue(out.contains("(no stocks)"), out);
         assertTrue(out.contains("(not set)"), out);
+        assertTrue(out.contains("Cash: $0.00"), out);
         assertTrue(out.contains("$1000.00"), out);
         assertTrue(out.contains("Target: 100% META"), out);
     }
@@ -225,7 +254,7 @@ class PortfolioCliTest {
     void runLoopProcessesInputUntilExit() throws IOException {
         PortfolioService service = mock(PortfolioService.class);
         when(service.createPortfolio("acc")).thenReturn(
-                new PortfolioSnapshot("acc", Set.of(), Map.of()));
+                new PortfolioSnapshot("acc", new TreeMap<>(), BigDecimal.ZERO, Optional.empty()));
         PortfolioCli looping = cliFor(service, "create acc\nexit\ncreate never\n");
 
         looping.run();
@@ -249,11 +278,9 @@ class PortfolioCliTest {
     @Test
     void rebalanceOutputUsesServicePlanVerbatim() {
         PortfolioService service = mock(PortfolioService.class);
-        when(service.rebalance("acc")).thenReturn(new RebalancePlan(List.of(
-                new TradeAction("META", TradeSide.SELL, 2, new BigDecimal("500")),
-                new TradeAction("AAPL", TradeSide.BUY, 5, new BigDecimal("190")))));
-        when(service.getPortfolio("acc")).thenReturn(new PortfolioSnapshot(
-                "acc", Set.of(new Stock("META", 2, BigDecimal.ONE)), Map.of()));
+        when(service.rebalance("acc")).thenReturn(new RebalancePlan(
+                List.of(new TradeAction("META", TradeSide.SELL, 2, new BigDecimal("500"))),
+                List.of(new TradeAction("AAPL", TradeSide.BUY, 5, new BigDecimal("190")))));
         PortfolioCli custom = cliFor(service, "");
 
         custom.execute("rebalance acc");
@@ -262,5 +289,6 @@ class PortfolioCliTest {
         assertTrue(out.indexOf("SELL") < out.indexOf("BUY"), "sells are listed before buys: " + out);
         assertTrue(out.contains("~$1000.00"), out);
         assertTrue(out.contains("~$950.00"), out);
+        assertTrue(out.contains("Net cash: +$50.00"), out);
     }
 }

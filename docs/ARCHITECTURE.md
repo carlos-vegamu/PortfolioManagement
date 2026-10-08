@@ -7,7 +7,7 @@ Pre-rendered SVG copies live in [`docs/diagrams/`](diagrams) for tools that don'
 |---|---------|---------|
 | 1 | [Layers and contracts](#1-layers-and-contracts) | Who talks to whom, which interfaces other modules consume or implement |
 | 2 | [Domain model](#2-domain-model) | The entities, their relationships and the ports the domain depends on |
-| 3 | [Rebalance flow](#3-rebalance-flow-rebalance-acc1-apply) | What happens at runtime for `rebalance <account> apply` |
+| 3 | [Rebalance flow](#3-rebalance-flow-rebalance-acc1-apply) | What happens at runtime for `rebalance <account> apply`, including concurrent updates |
 | 4 | [Rebalance algorithm](#4-rebalance-algorithm-proportionalrebalancestrategy) | How the buy/sell list is computed |
 | 5 | [Error handling](#5-error-handling) | Which failures exist and where they surface |
 
@@ -16,8 +16,9 @@ Pre-rendered SVG copies live in [`docs/diagrams/`](diagrams) for tools that don'
 ## 1. Layers and contracts
 
 Dependencies point **inwards**: the CLI and the main application depend on the `api` contract; the service
-depends on the domain and on `spi` interfaces; the domain depends only on its own ports.
-Concrete adapters (the mocks, the in-memory repository, the rebalance policy) are chosen in one place, `Main`.
+depends on the domain, on the `spi` interfaces and on its own `MarketDataProvider` contract; the domain depends
+on nothing outside itself. Concrete adapters (the mocks, the in-memory repository, the rebalance policy) are
+chosen in one place, `Main`.
 
 ```mermaid
 flowchart TB
@@ -30,23 +31,23 @@ flowchart TB
     SVC["DefaultPortfolioService<br/>orchestrates the use cases"]
 
     subgraph domain["Domain"]
-        PF["Portfolio (aggregate root)<br/>Stock · TargetAllocation · RebalancePlan<br/>TradeAction · PortfolioSnapshot"]
+        PF["Portfolio (immutable aggregate root)<br/>Stock · TargetAllocation · RebalancePlan · TradeAction<br/>PortfolioSnapshot · AllocationReport · MarketPrices"]
+        RS["RebalanceStrategy<br/>package domain"]
     end
 
-    subgraph ports["Ports - interfaces the module depends on"]
+    subgraph ports["Ports - interfaces the service depends on"]
         direction LR
         REPO["PortfolioRepository<br/>package spi"]
-        ACC["AccountDirectory<br/>package spi"]
-        MDP["MarketDataProvider<br/>package domain"]
-        RS["RebalanceStrategy<br/>package domain"]
+        ACC["AccountRepository<br/>package spi"]
+        MDP["MarketDataProvider<br/>package service"]
     end
 
     subgraph adapters["Adapters - chosen in Main"]
         direction LR
         MEM["InMemoryPortfolioRepository"]
-        MOCKACC["MockAccountDirectory"]
+        MOCKACC["MockAccountRepository"]
         MOCKMKT["MockMarketDataProvider"]
-        PRS["ProportionalRebalanceStrategy"]
+        PRS["ProportionalRebalanceStrategy<br/>package strategy"]
     end
 
     subgraph external["External services - future real implementations"]
@@ -63,7 +64,6 @@ flowchart TB
     SVC --> REPO
     SVC --> ACC
     SVC --> MDP
-    PF --> MDP
     PF --> RS
 
     REPO -.->|implemented by| MEM
@@ -78,9 +78,13 @@ flowchart TB
 
 **Reading guide**
 
-- **Consumers** only ever see `PortfolioService` and immutable `PortfolioSnapshot`s – never the mutable `Portfolio`.
-- **`spi`** interfaces are what other modules implement to plug real persistence / accounts in. `MarketDataProvider` is the same kind of port but lives in `domain` because `Portfolio` itself needs prices.
-- **`RebalanceStrategy`** is the open/closed extension point: add a new policy by implementing it, `Portfolio` does not change.
+- **Consumers** only ever see `PortfolioService` and immutable `PortfolioSnapshot`s / `AllocationReport`s.
+- **`spi`** interfaces are what other modules implement to plug real persistence / accounts in.
+  `MarketDataProvider` is the contract with the market-data service; it lives in `service`, its only user.
+  The domain never calls it: the service wraps it in a `MarketPrices` (each ticker read once per operation)
+  and passes that to `Portfolio`.
+- **`RebalanceStrategy`** is the open/closed extension point: add a new policy by implementing it (in `strategy`)
+  and passing it to `Portfolio.rebalance`; `Portfolio` does not change.
 
 ---
 
@@ -91,17 +95,18 @@ classDiagram
     direction TB
 
     class Portfolio {
-        <<aggregate root>>
+        <<immutable aggregate root>>
         -String accountId
-        -Map~String,Stock~ stocks
+        -SortedMap~String,Stock~ stocks
+        -BigDecimal cash
         -TargetAllocation targetAllocation
-        +addStock(ticker, quantity, price)
-        +sellStock(ticker, quantity)
-        +setTargetAllocation(allocation)
+        +addStock(ticker, quantity, price) Portfolio
+        +sellStock(ticker, quantity) Portfolio
+        +withTargetAllocation(allocation) Portfolio
         +getTotalValue(prices) BigDecimal
-        +getCurrentAllocation(prices) Map
-        +rebalance(prices) RebalancePlan
-        +applyRebalance(plan)
+        +getCurrentAllocation(prices) AllocationReport
+        +rebalance(strategy, prices) RebalancePlan
+        +applyRebalance(plan) Portfolio
         +snapshot() PortfolioSnapshot
     }
 
@@ -117,17 +122,19 @@ classDiagram
 
     class TargetAllocation {
         <<value object>>
-        -Map~String,BigDecimal~ percentages
+        -SortedMap~String,BigDecimal~ percentages
         +of(percentages)$ TargetAllocation
         +percentageFor(ticker) BigDecimal
         +tickers() Set
+        +asMap() SortedMap
     }
 
     class RebalancePlan {
         <<record>>
-        +List~TradeAction~ actions
-        +buys() List
-        +sells() List
+        +List~TradeAction~ sells
+        +List~TradeAction~ buys
+        +proceeds() BigDecimal
+        +cost() BigDecimal
         +isEmpty() boolean
     }
 
@@ -149,29 +156,40 @@ classDiagram
     class PortfolioSnapshot {
         <<record, read-only copy>>
         +String accountId
-        +Set~Stock~ stocks
-        +Map targetAllocation
+        +SortedMap~String,Stock~ stocks
+        +BigDecimal cash
+        +Optional~TargetAllocation~ targetAllocation
+    }
+
+    class AllocationReport {
+        <<record>>
+        +SortedMap~String,BigDecimal~ current
+        +BigDecimal cashPercentage
+        +Optional~TargetAllocation~ target
+    }
+
+    class MarketPrices {
+        <<one per operation>>
+        +from(source)$ MarketPrices
+        +of(prices)$ MarketPrices
+        +priceOf(ticker) BigDecimal
     }
 
     class RebalanceStrategy {
         <<interface>>
-        +plan(holdings, target, prices) RebalancePlan
-    }
-
-    class MarketDataProvider {
-        <<interface>>
-        +getPrice(ticker) BigDecimal
+        +plan(holdings, cash, target, prices) RebalancePlan
     }
 
     class ProportionalRebalanceStrategy {
-        +plan(holdings, target, prices) RebalancePlan
+        +plan(holdings, cash, target, prices) RebalancePlan
     }
 
     Portfolio "1" *-- "0..*" Stock : holds, one per ticker
     Portfolio "1" o-- "0..1" TargetAllocation : aims for
-    Portfolio ..> RebalanceStrategy : delegates planning
-    Portfolio ..> MarketDataProvider : asks for prices
+    Portfolio ..> RebalanceStrategy : plans with (method argument)
+    Portfolio ..> MarketPrices : values with
     Portfolio ..> PortfolioSnapshot : creates
+    Portfolio ..> AllocationReport : creates
     Portfolio ..> RebalancePlan : returns / applies
     RebalancePlan "1" *-- "0..*" TradeAction
     TradeAction --> TradeSide
@@ -184,12 +202,14 @@ classDiagram
 | Rule | Where |
 |------|-------|
 | Ticker is trimmed, upper-cased and matches `[A-Z][A-Z0-9.-]{0,9}` | `Stock.normalizeTicker` |
-| Quantity is a positive whole number; price is positive | `Stock`, `TradeAction` |
+| Quantity is a positive whole number; price is positive | `Stock`, `TradeAction`, `MarketPrices` |
 | At most one position per ticker (re-buying merges, average price is the weighted average) | `Portfolio.addStock` |
 | A position that is fully sold disappears; you cannot sell more than you hold | `Portfolio.sellStock` |
-| Target percentages are in (0, 100], tickers are unique and the sum is **exactly 100** | `TargetAllocation.of` |
-| Rebalancing needs a target; `rebalance()` never mutates, `applyRebalance()` validates all sells before changing anything | `Portfolio` |
-| **One portfolio per account** | `DefaultPortfolioService.createPortfolio` |
+| Target percentages are in (0, 100], tickers are unique and the sum is **exactly 100**; stored without trailing zeros | `TargetAllocation.of` |
+| Cash is never negative; only rebalancing changes it | `Portfolio.applyRebalance` |
+| Rebalancing needs a target; `rebalance()` never changes anything; `applyRebalance()` checks the total sold per ticker against the holdings and the buys against cash + proceeds before changing anything, and is all-or-nothing | `Portfolio` |
+| A plan contains only sells in `sells` and only buys in `buys` | `RebalancePlan` |
+| **One portfolio per account** | `PortfolioRepository.saveIfAbsent` (atomic) |
 
 ---
 
@@ -208,32 +228,41 @@ sequenceDiagram
 
     User->>CLI: rebalance acc1 apply
     CLI->>Svc: rebalanceAndApply("acc1")
-    Svc->>Repo: findByAccountId("acc1")
-    Repo-->>Svc: Portfolio (or PortfolioNotFoundException)
-
-    Svc->>PF: rebalance(marketData)
-    alt no target allocation defined
-        PF-->>Svc: InvalidAllocationException
-    else target defined
-        PF->>Strat: plan(stocks, target, marketData)
-        loop every ticker held or targeted
-            Strat->>Mkt: getPrice(ticker)
-            Mkt-->>Strat: price (or PriceUnavailableException)
+    loop until the commit succeeds
+        Svc->>Repo: findByAccountId("acc1")
+        Repo-->>Svc: current Portfolio (or PortfolioNotFoundException)
+        Svc->>PF: rebalance(strategy, new MarketPrices)
+        alt no target allocation defined
+            PF-->>Svc: InvalidAllocationException
+        else target defined
+            PF->>Strat: plan(stocks, cash, target, prices)
+            loop every ticker held or targeted
+                Strat->>Mkt: getPrice(ticker), once per ticker
+                Mkt-->>Strat: price (or PriceUnavailableException)
+            end
+            Strat-->>PF: RebalancePlan (sells + buys)
+            PF-->>Svc: RebalancePlan
         end
-        Strat-->>PF: RebalancePlan (sells + buys)
-        PF-->>Svc: RebalancePlan
+        Svc->>PF: applyRebalance(plan)
+        Note over PF: check total sold per ticker and cash,<br/>then build a new Portfolio
+        PF-->>Svc: updated Portfolio
+        Svc->>Repo: replace(current, updated)
+        Note over Svc,Repo: false if another thread committed first:<br/>re-read and plan again
     end
-
-    Svc->>PF: applyRebalance(plan)
-    Note over PF: validate every sell first,<br/>then sell, then buy
-    Svc->>Repo: save(portfolio)
     Svc-->>CLI: RebalancePlan
-    CLI-->>User: prints SELL / BUY lines
+    CLI-->>User: prints SELL / BUY lines and net cash
 
     Note over CLI,User: any PortfolioException is caught by the CLI<br/>and printed as "Error: …"
 ```
 
-`rebalance <account>` (without `apply`) calls `PortfolioService.rebalance` instead: it stops after step 11, returns the plan and leaves the portfolio untouched (nothing is applied or saved).
+`rebalance <account>` (without `apply`) calls `PortfolioService.rebalance` instead: it reads the portfolio once,
+returns the plan and commits nothing.
+
+**Concurrency.** `Portfolio` is immutable, so a reader always sees one complete state, and a change can be
+retried freely because building the new state has no side effects. `replace` is a compare-and-set (in memory, a
+single `ConcurrentHashMap.replace(key, expected, updated)` call), so of two concurrent changes to one account
+exactly one commits and the other is re-run on top of it: nothing is lost, and a plan is always applied to the
+state it was computed from. No lock is held while prices are fetched.
 
 ---
 
@@ -241,42 +270,41 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A(["Input: holdings, target, prices"])
-    B{"Holdings empty?"}
+    A(["Input: holdings, cash, target, prices"])
+    B{"No holdings and no cash?"}
     Z(["Empty plan - nothing to distribute"])
 
     subgraph setup["Setup - once"]
-        C["Price every ticker held or targeted<br/>total = sum of quantity x price over holdings"]
+        C["Price every ticker held or targeted (once each)<br/>total = cash + sum of quantity x price"]
     end
 
-    subgraph sells["Phase 1 - for each ticker"]
-        D["targetValue = total x target% / 100<br/>(ticker not in target: 0%)<br/>gap = targetValue - currentValue"]
-        F{"gap"}
-        G["SELL round-to-nearest(-gap / price) shares<br/>proceeds += sale value<br/>(0 shares: no order)"]
-        H["record as deficit"]
+    subgraph step1["Step 1 - for each ticker"]
+        D["targetValue = total x target% / 100<br/>(ticker not in target: 0%)<br/>wanted = floor(targetValue / price)<br/>leftover = total - sum of wanted x price"]
     end
 
-    subgraph buys["Phase 2 - buys, largest deficit first"]
-        J["sort deficits by gap, descending"]
-        K["shares = min( floor(gap / price), floor(budget / price) )<br/>budget starts at proceeds, minus each buy"]
+    subgraph step2["Step 2 - spend the leftover"]
+        E["underweight tickers, largest gap first:<br/>one more share each while leftover >= price"]
     end
 
-    L(["Plan = sells + buys<br/>buys never exceed sale proceeds"])
+    subgraph step3["Step 3 - don't sell into idle cash"]
+        F["targeted tickers being sold:<br/>keep as many shares as the leftover still covers"]
+    end
+
+    L(["Plan: SELL held - wanted, BUY wanted - held<br/>buys <= cash + proceeds; the rest stays as cash"])
 
     A --> B
     B -- yes --> Z
     B -- no --> C
     C --> D
-    D --> F
-    F -- "negative: overweight" --> G
-    F -- "positive: underweight" --> H
-    G --> J
-    H --> J
-    J --> K
-    K --> L
+    D --> E
+    E --> F
+    F --> L
 ```
 
-The plan is **self-financing** (no extra cash assumed) and in **whole shares**, so a small residual drift from the exact target is expected.
+All arithmetic is exact (`BigDecimal`), so the value of the holdings plus the cash is the same before and after a
+plan is applied, and planning again at the same prices gives an empty plan. Whole shares leave a small drift
+from the exact target: below one share per ticker, plus a cash remainder no underweight stock can be bought
+with. Cost is O(n log n) for n tickers, with one price lookup per ticker.
 
 ---
 
@@ -293,21 +321,26 @@ classDiagram
     PortfolioException <|-- PortfolioNotFoundException
     PortfolioException <|-- InvalidAllocationException
     PortfolioException <|-- InsufficientQuantityException
+    PortfolioException <|-- InsufficientCashException
     PortfolioException <|-- PriceUnavailableException
 ```
 
 | Exception | Raised by | When |
 |-----------|-----------|------|
-| `AccountNotFoundException` | `DefaultPortfolioService` | `createPortfolio` for an account the `AccountDirectory` does not know |
+| `AccountNotFoundException` | `DefaultPortfolioService` | `createPortfolio` for an account the `AccountRepository` does not know |
 | `PortfolioAlreadyExistsException` | `DefaultPortfolioService` | `createPortfolio` for an account that already has one |
 | `PortfolioNotFoundException` | `DefaultPortfolioService` | any operation on an account without a portfolio |
 | `InvalidAllocationException` | `TargetAllocation`, `Portfolio` | percentages malformed or not summing to 100; `rebalance` without a target |
-| `InsufficientQuantityException` | `Portfolio` | selling more shares than held (also when applying a plan) |
-| `PriceUnavailableException` | `MarketDataProvider` implementations | no price for a ticker needed for valuation or rebalancing |
+| `InsufficientQuantityException` | `Portfolio` | selling more shares than held, including a plan whose sells of one ticker add up to more than is held |
+| `InsufficientCashException` | `Portfolio` | applying a plan whose buys cost more than the cash plus its sale proceeds |
+| `PriceUnavailableException` | `MarketDataProvider` implementations, `MarketPrices` | no price for a ticker needed for valuation or rebalancing |
 
-**Propagation:** the domain throws, `DefaultPortfolioService` logs the failure once at ERROR and rethrows, and the caller decides what to do:
-`PortfolioCli` logs a WARN and prints `Error: …`; the main application can handle them as it sees fit.
-Malformed input (bad ticker, non-positive quantity or price) is an `IllegalArgumentException`, handled the same way by the CLI.
+**Propagation:** the domain throws, `DefaultPortfolioService` logs the failure **once** and rethrows, and the caller
+decides what to do: `PortfolioCli` prints `Error: …` without logging again; the main application can handle them
+as it sees fit. Malformed input (bad ticker, non-positive quantity or price) is an `IllegalArgumentException`,
+handled the same way by the CLI.
 
-Logging (SLF4J + Logback → `logs/portfolio.log`): `Portfolio` logs state changes at INFO, the service logs creation and failed operations,
-and the CLI logs every command plus recoverable failures (WARN) and unexpected ones (ERROR with stack trace).
+Logging (SLF4J + Logback → `logs/portfolio.log`): the service logs every committed change at INFO, rejected
+business rules at WARN, malformed input at INFO and unexpected failures at ERROR with their stack trace. `Portfolio`
+does not log: it is an immutable value whose methods may run more than once when a concurrent update forces a
+retry. The CLI logs every command it receives.

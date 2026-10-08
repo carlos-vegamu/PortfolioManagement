@@ -3,6 +3,7 @@ package org.example.portfolio.api;
 import java.math.BigDecimal;
 import java.util.Map;
 
+import org.example.portfolio.domain.AllocationReport;
 import org.example.portfolio.domain.PortfolioSnapshot;
 import org.example.portfolio.domain.RebalancePlan;
 import org.example.portfolio.exception.AccountNotFoundException;
@@ -15,6 +16,10 @@ import org.example.portfolio.exception.PriceUnavailableException;
 /**
  * Contract the rest of the application uses to work with portfolios. Every method is
  * keyed by account id; an account owns at most one portfolio.
+ *
+ * <p>Implementations are safe to call from several threads. Each operation works on one
+ * consistent state of the portfolio, and changes are atomic: concurrent changes to the same
+ * account never interleave and are never lost.
  */
 public interface PortfolioService {
 
@@ -52,12 +57,13 @@ public interface PortfolioService {
     PortfolioSnapshot setTargetAllocation(String accountId, Map<String, BigDecimal> percentagesByTicker);
 
     /**
-     * Current distribution of market value by ticker, in percent.
+     * Current distribution of the portfolio's value over its stocks and cash, in percent, next to
+     * the target allocation.
      *
      * @throws PortfolioNotFoundException   if the account has no portfolio
      * @throws PriceUnavailableException    if a held ticker has no market price
      */
-    Map<String, BigDecimal> getCurrentAllocation(String accountId);
+    AllocationReport getCurrentAllocation(String accountId);
 
     /**
      * Computes, without executing it, the orders needed to reach the target allocation.
@@ -68,6 +74,10 @@ public interface PortfolioService {
      */
     RebalancePlan rebalance(String accountId);
 
-    /** Same as {@link #rebalance(String)} but also updates the holdings as if the orders were executed. */
+    /**
+     * Same as {@link #rebalance(String)} but also executes the plan, atomically: the plan is
+     * computed from and applied to the same state. Sale proceeds not spent on whole shares stay
+     * in the portfolio as cash.
+     */
     RebalancePlan rebalanceAndApply(String accountId);
 }

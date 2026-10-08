@@ -17,8 +17,8 @@ class RebalancePlanTest {
     private static final TradeAction SELL = new TradeAction("meta", TradeSide.SELL, 2, new BigDecimal("500"));
 
     @Test
-    void splitsActionsIntoBuysAndSells() {
-        RebalancePlan plan = new RebalancePlan(List.of(BUY, SELL));
+    void keepsSellsAndBuysApart() {
+        RebalancePlan plan = new RebalancePlan(List.of(SELL), List.of(BUY));
 
         assertEquals(List.of(BUY), plan.buys());
         assertEquals(List.of(SELL), plan.sells());
@@ -26,19 +26,34 @@ class RebalancePlanTest {
     }
 
     @Test
-    void emptyPlanHasNoActions() {
+    void rejectsOrdersOnTheWrongSide() {
+        assertThrows(IllegalArgumentException.class, () -> new RebalancePlan(List.of(BUY), List.of()));
+        assertThrows(IllegalArgumentException.class, () -> new RebalancePlan(List.of(), List.of(SELL)));
+    }
+
+    @Test
+    void proceedsAndCostAddUpTheOrders() {
+        RebalancePlan plan = new RebalancePlan(List.of(SELL), List.of(BUY, BUY));
+
+        assertEquals(0, new BigDecimal("1000").compareTo(plan.proceeds()));
+        assertEquals(0, new BigDecimal("1140").compareTo(plan.cost()));
+    }
+
+    @Test
+    void emptyPlanHasNoOrders() {
         assertTrue(RebalancePlan.empty().isEmpty());
         assertTrue(RebalancePlan.empty().buys().isEmpty());
+        assertEquals(0, BigDecimal.ZERO.compareTo(RebalancePlan.empty().proceeds()));
     }
 
     @Test
     void planIsDefensivelyCopied() {
         List<TradeAction> source = new ArrayList<>(List.of(BUY));
-        RebalancePlan plan = new RebalancePlan(source);
-        source.add(SELL);
+        RebalancePlan plan = new RebalancePlan(List.of(), source);
+        source.add(BUY);
 
-        assertEquals(1, plan.actions().size());
-        assertThrows(UnsupportedOperationException.class, () -> plan.actions().add(SELL));
+        assertEquals(1, plan.buys().size());
+        assertThrows(UnsupportedOperationException.class, () -> plan.buys().add(BUY));
     }
 
     @Test
